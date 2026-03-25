@@ -5,6 +5,7 @@ from data_io import (
     make_donor_negative,
 )
 from scanner import SpliceSiteScanner
+import pickle
 
 
 def compare_models(
@@ -65,6 +66,25 @@ def compare_models(
     wam.print_summary()
 
 
+def train_and_save_model(train_pos, train_neg, model_path="wam_model.pkl"):
+    """Train WAM model on training data and save to file."""
+    wam = WAMModel(window=DONOR_WINDOW, site="donor")
+    wam.train(train_pos, train_neg)
+    with open(model_path, "wb") as f:
+        pickle.dump(wam, f)
+    print(f"Model saved to {model_path}")
+    return wam
+
+
+def predict_on_sequence(sequence, model_path="wam_model.pkl", threshold=1.0):
+    """Load trained model and predict splice sites in input sequence."""
+    with open(model_path, "rb") as f:
+        wam = pickle.load(f)
+    scanner = SpliceSiteScanner(wam, threshold=threshold)
+    hits = scanner.scan(sequence)
+    return hits
+
+
 def demo() -> None:
     training_dir = "/Users/shiroko/FlutterProjects/BDM Homework/Training and testing datasets/Training Set"
     testing_dir = "/Users/shiroko/FlutterProjects/BDM Homework/Training and testing datasets/Testing Set"
@@ -94,18 +114,19 @@ def demo() -> None:
 
     compare_models(train_pos, train_neg, test_pos, test_neg)
 
-    print("\n── Genome scan demo ──────────────────────────────")
-    wam = WAMModel(window=DONOR_WINDOW, site="donor")
-    wam.train(train_pos, train_neg)
-    scanner = SpliceSiteScanner(wam, threshold=1.0)
+    # Train and save model
+    model_path = "wam_model.pkl"
+    train_and_save_model(train_pos, train_neg, model_path)
 
+    print("\n── Genome scan demo ──────────────────────────────")
+    # Load model and predict on sequence
     genome = ("ATCGATCGATCG"
               "CAGGTAAGTATCG"
               "GCATCGATCGATCG"
               "AAGGTAAGTGCTA"
               "TTTGCATCGATCG")
 
-    hits = scanner.scan(genome)
+    hits = predict_on_sequence(genome, model_path, threshold=1.0)
     print(f"Genome length: {len(genome)} bp")
     for pos, sc in hits:
         context = genome[max(0, pos-2): pos+5]
