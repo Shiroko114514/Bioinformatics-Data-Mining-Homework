@@ -20,6 +20,7 @@ Usage
 """
 
 import math
+import os
 import random
 from collections import defaultdict
 from typing import List, Tuple, Dict, Optional
@@ -448,6 +449,35 @@ def load_fasta(path: str) -> List[str]:
     return seqs
 
 
+def load_fasta_sequences(pos_path: str, neg_path: str) -> Tuple[List[str], List[str]]:
+    """Load positive and negative sample fasta files from a given paths."""
+    pos_seqs = load_fasta(pos_path)
+    neg_seqs = load_fasta(neg_path)
+    return pos_seqs, neg_seqs
+
+
+def load_txt_sequences_from_dir(dir_path: str) -> List[str]:
+    """Load all sequences from *.txt files in a directory (strip whitespace)."""
+    seqs: List[str] = []
+    if not os.path.isdir(dir_path):
+        return seqs
+    for fname in sorted(os.listdir(dir_path)):
+        if not fname.lower().endswith('.txt'):
+            continue
+        full = os.path.join(dir_path, fname)
+        if not os.path.isfile(full):
+            continue
+        with open(full) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('>'):
+                    continue
+                seqs.append(line)
+    return seqs
+
+
 # ─────────────────────────────────────────────────────────────
 # Synthetic demo dataset generator
 # ─────────────────────────────────────────────────────────────
@@ -568,17 +598,43 @@ def compare_models(
 
 
 def demo() -> None:
-    """Run a self-contained synthetic demo."""
+    """Run a self-contained synthetic demo, or load data from folders when available."""
     random.seed(42)
 
-    print("Generating synthetic donor site dataset …")
-    all_pos = make_donor_positive(1000)
-    all_neg = make_donor_negative(1000)
+    training_dir = "/Users/shiroko/FlutterProjects/BDM Homework/Training and testing datasets/Training Set"
+    testing_dir = "/Users/shiroko/FlutterProjects/BDM Homework/Training and testing datasets/Testing Set"
 
-    # 80/20 split
-    split = 800
-    train_pos, test_pos = all_pos[:split], all_pos[split:]
-    train_neg, test_neg = all_neg[:split], all_neg[split:]
+    train_pos = load_txt_sequences_from_dir(training_dir)
+    train_neg = []  # not provided separately;训练集 txt 全部当正 samples。
+    test_pos = load_txt_sequences_from_dir(testing_dir)
+    test_neg = []
+
+    if train_pos and test_pos:
+        print(f"Loading data from {training_dir} and {testing_dir} ...")
+    else:
+        print("Training/testing directories not found or empty; generating synthetic dataset …")
+        all_pos = make_donor_positive(1000)
+        all_neg = make_donor_negative(1000)
+
+        split = 800
+        train_pos, test_pos = all_pos[:split], all_pos[split:]
+        train_neg, test_neg = all_neg[:split], all_neg[split:]
+
+        compare_models(train_pos, train_neg, test_pos, test_neg)
+        # separate之后就直接返回，否则后续io会失败 (empty neg)
+        print("Synthetic demo finished.")
+        return
+
+    # 默认训练+测试路径机制：如果训练/测试目录里有序列，则用它们；
+    #   训练集为正样本，测试集为负样本（你可以根据需求改成分文件或正负分开）
+    if not test_neg:
+        print("Warning: test_neg is empty; using test_pos as neg for evaluation fallback.")
+        test_neg = test_pos[:len(test_pos)//2]
+        test_pos = test_pos[len(test_pos)//2:]
+
+    if not train_neg:
+        print("Warning: train_neg is empty; using random negatives from synthetic generator fallback.")
+        train_neg = make_donor_negative(len(train_pos))
 
     compare_models(train_pos, train_neg, test_pos, test_neg)
 
