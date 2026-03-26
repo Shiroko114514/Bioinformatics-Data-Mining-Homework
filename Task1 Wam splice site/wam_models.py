@@ -175,7 +175,6 @@ class WAMModel:
 
     def print_summary(self) -> None:
         ic = self.information_content()
-        assert self.first_fg is not None and self.wam_fg is not None
         print(f"\nWAM Summary — {self.site} site  (window={self.window})")
         print("=" * 55)
         print(f"{'Pos':>4}  {'IC (bits)':>10}  {'Top conditional (prev→curr)':}")
