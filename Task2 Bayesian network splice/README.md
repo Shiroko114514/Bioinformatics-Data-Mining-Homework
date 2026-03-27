@@ -14,7 +14,7 @@ python3 splice_main.py --demo
 
 ### 3. 输入一段序列预测 
 
-```bash
+```bashm
 python3 splice_main.py --predict "ACGTTGGTAGT..." --site donor --threshold 0.0
 ```
 
@@ -23,15 +23,6 @@ python3 splice_main.py --predict "ACGTTGGTAGT..." --site donor --threshold 0.0
 - `--threshold`：模型分数阈值（默认为 `0.0`）
 - `--window`：`9` 或 `23`，若未设置则根据 `site` 自动选择
 - `--no-real-data`：使用合成数据而非真实集
-
-### 4. 旧脚本已删除
-
-`Task2 Bayesian network splice.py` 已经从项目中移除，当前请直接使用模块化入口：
-
-```bash
-cd "Task2 Bayesian network splice"
-python3 splice_main.py --demo
-```
 
 ## 数据集路径
 
