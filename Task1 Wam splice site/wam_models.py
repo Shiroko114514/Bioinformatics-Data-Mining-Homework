@@ -174,6 +174,8 @@ class WAMModel:
         return ic
 
     def print_summary(self) -> None:
+        if self.wam_fg is None or self.first_fg is None:
+            raise RuntimeError("Model not trained. Call train() first.")
         ic = self.information_content()
         print(f"\nWAM Summary — {self.site} site  (window={self.window})")
         print("=" * 55)

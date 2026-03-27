@@ -119,8 +119,11 @@ def load_sequences_from_dir(dir_path: str) -> List[str]:
     return result
 
 
+from typing import Optional
+
+
 def generate_negative_samples(all_sequences: List[str], n_neg: int, window: int = 9,
-                               exclude_sites: Set[str] = None) -> List[str]:
+                               exclude_sites: Optional[Set[str]] = None) -> List[str]:
     if exclude_sites is None:
         exclude_sites = set()
     negs = []
