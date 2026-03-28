@@ -1,715 +1,477 @@
 """
-Bayesian Network model for eukaryotic splice site prediction
-============================================================
+SVM-based splice site prediction for eukaryotic genes
+======================================================
 References:
-  Chow & Liu (1968)   – Approximating discrete probability distributions with
-                        dependence trees. IEEE Trans. Inform. Theory 14:462-467.
-  Friedman et al.     – Using Bayesian networks to analyze expression data (2000)
-  Zhang & Marr (1993) – WAM method (baseline for comparison)
+  Zien et al. (2000)   – Engineering support vector machine kernels that
+                          recognize translation initiation sites. Bioinformatics.
+  Sonnenburg et al.    – Large scale training of SVMs with application to
+                          splice site prediction. JMLR (2006).
+  Vapnik (1995)        – The Nature of Statistical Learning Theory.
 
-Key ideas
----------
-  WMM  : P(s) = ∏ᵢ P(xᵢ)                       — positions independent
-  WAM  : P(s) = P(x₀) ∏ᵢ₌₁ P(xᵢ | xᵢ₋₁)        — chain (first-order Markov)
-  BN   : P(s) = ∏ᵢ P(xᵢ | Pa(xᵢ))               — DAG, Pa learned from data
+Key ideas vs. probabilistic models (WMM / WAM / BN)
+----------------------------------------------------
+  WMM / WAM / BN : generative models  — P(x | class)
+  SVM            : discriminative model — maximises P(class | x) margin
 
-Structure learning:
-  1. Compute pairwise mutual information MI(i,j) for all position pairs.
-  2. Chow-Liu: find maximum spanning tree of the MI graph (Kruskal's MST).
-     This yields the optimal tree-structured BN under KL divergence.
-  3. (Optional) BIC-based greedy hill-climbing to allow multi-parent nodes.
+SVM discriminant:
+  f(x) = sign( Σᵢ αᵢ yᵢ K(xᵢ, x) + b )
 
-Scoring:
-  log-odds(s) = log P(s | fg BN) − log P(s | bg BN)
+  Linear  kernel: K(x,x') = x·x'                     → interpretable weight vector
+  RBF     kernel: K(x,x') = exp(−γ ‖x−x'‖²)          → best for nonlinear boundaries
+  Poly    kernel: K(x,x') = (x·x' + 1)^d              → captures interaction terms
+
+Feature representations
+-----------------------
+  one_hot       : L × 4 binary indicator matrix (flattened)  → 36 dims for 9-bp window
+  kmer          : counts of all k-mers in window (k=2 → 16, k=3 → 64)
+  pwm_score     : per-position WMM log-odds (L dims)
+  dinucleotide  : position-specific dinucleotide one-hot ((L-1)×16 dims)
+  combined      : concatenation of any subset above
 
 Usage
 -----
->>> from bayesian_network_splice import BayesianNetworkModel, demo
->>> model = BayesianNetworkModel(window=9, site='donor', structure='chow-liu')
->>> model.train(pos_seqs, neg_seqs)
->>> score = model.score('CAGGTAAGT')
->>> model.print_summary()
+>>> from svm_splice_site import SVMSpliceSite, FeatureExtractor, demo
+>>> fe   = FeatureExtractor(window=9, features=['one_hot', 'kmer2', 'kmer3'])
+>>> svm  = SVMSpliceSite(window=9, kernel='rbf', feature_set=['one_hot','kmer2','kmer3'])
+>>> svm.train(pos_seqs, neg_seqs)
+>>> score = svm.decision_score('CAGGTAAGT')
+>>> svm.print_summary()
 >>> demo()
 """
 
 import math
 import random
-from collections import defaultdict, deque
-from typing import List, Dict, Tuple, Optional
+import itertools
+from typing import List, Dict, Tuple, Optional, Union
+
+import numpy as np
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (matthews_corrcoef, roc_auc_score,
+                              precision_score, recall_score, f1_score,
+                              confusion_matrix)
 
 # ─────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-BASES      = ('A', 'C', 'G', 'T')
-BASE_IDX   = {b: i for i, b in enumerate(BASES)}
-PSEUDOCOUNT = 0.5
-DONOR_WINDOW    = 9   # exon[-3,-2,-1] | intron[+1..+6]
+BASES          = ('A', 'C', 'G', 'T')
+BASE_IDX       = {b: i for i, b in enumerate(BASES)}
+PSEUDOCOUNT    = 0.5
+DONOR_WINDOW   = 9    # exon[-3,-2,-1] | intron[+1..+6]
 ACCEPTOR_WINDOW = 23  # intron[-20..-1] | exon[+1..+3]
+DONOR_GT_POS   = 3    # 0-indexed start of GT in 9-bp window
+ACCEPTOR_AG_POS = 20  # 0-indexed start of AG in 23-bp window
 
 # ─────────────────────────────────────────────────────────────
 # Sequence utilities
 # ─────────────────────────────────────────────────────────────
 
 def validate_seqs(seqs: List[str], window: int) -> List[str]:
-    """Filter to valid uppercase ACGT sequences of the correct length."""
-    result = []
+    out = []
     for s in seqs:
         s = s.upper().strip()
         if len(s) == window and all(c in BASE_IDX for c in s):
-            result.append(s)
-    return result
+            out.append(s)
+    return out
 
-def empirical_bg(seqs: List[str]) -> Dict[str, float]:
-    counts: Dict[str, float] = {b: PSEUDOCOUNT for b in BASES}
-    total = sum(counts.values())
-    for s in seqs:
-        for c in s:
+
+# ─────────────────────────────────────────────────────────────
+# Feature extraction
+# ─────────────────────────────────────────────────────────────
+
+class FeatureExtractor:
+    """
+    Transform raw nucleotide windows into numeric feature vectors.
+
+    Supported feature types
+    -----------------------
+    'one_hot'     : flattened one-hot, shape (4L,)
+    'kmer2'       : dinucleotide frequencies, shape (16,)
+    'kmer3'       : trinucleotide frequencies, shape (64,)
+    'dinuc_pos'   : position-specific dinucleotide one-hot, shape (16*(L-1),)
+    'pwm'         : per-position WMM log-odds trained on pos set, shape (L,)
+    'combined'    : concatenation of all of the above
+    """
+
+    ALL_FEATURES = ('one_hot', 'kmer2', 'kmer3', 'dinuc_pos', 'pwm')
+
+    def __init__(self, window: int,
+                 features: Union[str, List[str]] = 'combined') -> None:
+        self.window = window
+        if features == 'combined':
+            self.features = list(self.ALL_FEATURES)
+        elif isinstance(features, str):
+            self.features = [features]
+        else:
+            self.features = list(features)
+
+        self._kmers2 = [''.join(p) for p in itertools.product(BASES, repeat=2)]
+        self._kmers3 = [''.join(p) for p in itertools.product(BASES, repeat=3)]
+        self._kmer2_idx = {k: i for i, k in enumerate(self._kmers2)}
+        self._kmer3_idx = {k: i for i, k in enumerate(self._kmers3)}
+
+        self._pwm_lo: Optional[List[Dict[str, float]]] = None  # set by fit()
+
+    # ── Fit (for PWM feature) ─────────────────────────────────
+
+    def fit(self, pos_seqs: List[str]) -> 'FeatureExtractor':
+        """
+        Estimate foreground PWM from positive sequences.
+        Must be called before extracting 'pwm' features.
+        """
+        n = self.window
+        counts = [{b: PSEUDOCOUNT for b in BASES} for _ in range(n)]
+        for seq in pos_seqs:
+            for i, c in enumerate(seq[:n]):
+                if c in BASE_IDX:
+                    counts[i][c] += 1
+        bg = {b: 0.25 for b in BASES}
+        self._pwm_lo = []
+        for pos_ct in counts:
+            total = sum(pos_ct.values())
+            self._pwm_lo.append(
+                {b: math.log(max(pos_ct[b] / total, 1e-10) / bg[b])
+                 for b in BASES}
+            )
+        return self
+
+    # ── Individual feature functions ──────────────────────────
+
+    def _one_hot(self, seq: str) -> np.ndarray:
+        """Shape: (4 * window,)"""
+        vec = np.zeros(4 * self.window, dtype=np.float32)
+        for i, c in enumerate(seq):
             if c in BASE_IDX:
-                counts[c] += 1
-                total += 1
-    return {b: counts[b] / total for b in BASES}
+                vec[i * 4 + BASE_IDX[c]] = 1.0
+        return vec
 
-# ─────────────────────────────────────────────────────────────
-# Union-Find (for Kruskal's MST)
-# ─────────────────────────────────────────────────────────────
+    def _kmer_freq(self, seq: str, k: int) -> np.ndarray:
+        """Normalised k-mer frequency vector, shape (4^k,)."""
+        idx_map = self._kmer2_idx if k == 2 else self._kmer3_idx
+        n_kmers = len(idx_map)
+        vec = np.zeros(n_kmers, dtype=np.float32)
+        count = 0
+        for i in range(len(seq) - k + 1):
+            km = seq[i:i+k]
+            if km in idx_map:
+                vec[idx_map[km]] += 1
+                count += 1
+        if count > 0:
+            vec /= count
+        return vec
 
-class _UnionFind:
-    def __init__(self, n: int) -> None:
-        self.parent = list(range(n))
-        self.rank   = [0] * n
+    def _dinuc_pos(self, seq: str) -> np.ndarray:
+        """
+        Position-specific dinucleotide one-hot.
+        Shape: ((window-1) * 16,)
+        Captures the same first-order info as WAM but as binary features.
+        """
+        size = (self.window - 1) * 16
+        vec  = np.zeros(size, dtype=np.float32)
+        for i in range(self.window - 1):
+            a, b = seq[i], seq[i + 1]
+            if a in BASE_IDX and b in BASE_IDX:
+                di_idx = BASE_IDX[a] * 4 + BASE_IDX[b]
+                vec[i * 16 + di_idx] = 1.0
+        return vec
 
-    def find(self, x: int) -> int:
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])
-        return self.parent[x]
-
-    def union(self, x: int, y: int) -> bool:
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return False
-        if self.rank[rx] < self.rank[ry]:
-            rx, ry = ry, rx
-        self.parent[ry] = rx
-        if self.rank[rx] == self.rank[ry]:
-            self.rank[rx] += 1
-        return True
-
-# ─────────────────────────────────────────────────────────────
-# Mutual Information computation
-# ─────────────────────────────────────────────────────────────
-
-def _marginals(seqs: List[str], n: int) -> List[Dict[str, float]]:
-    """Marginal frequency P(b | position=i) for i in 0..n-1."""
-    counts = [{b: PSEUDOCOUNT for b in BASES} for _ in range(n)]
-    for seq in seqs:
-        for i, c in enumerate(seq[:n]):
+    def _pwm_scores(self, seq: str) -> np.ndarray:
+        """Per-position log-odds score vector, shape (window,)."""
+        if self._pwm_lo is None:
+            raise RuntimeError("Call fit() before extracting 'pwm' features.")
+        vec = np.zeros(self.window, dtype=np.float32)
+        for i, c in enumerate(seq[:self.window]):
             if c in BASE_IDX:
-                counts[i][c] += 1
-    result = []
-    for pos in counts:
-        total = sum(pos.values())
-        result.append({b: pos[b] / total for b in BASES})
-    return result
+                vec[i] = float(self._pwm_lo[i].get(c, 0.0))
+        return vec
 
-def _joint(seqs: List[str], i: int, j: int) -> Dict[Tuple[str, str], float]:
-    """Joint distribution P(xᵢ=a, xⱼ=b)."""
-    counts: Dict[Tuple[str, str], float] = defaultdict(lambda: PSEUDOCOUNT)
-    for seq in seqs:
-        a, b = seq[i], seq[j]
-        if a in BASE_IDX and b in BASE_IDX:
-            counts[(a, b)] += 1
-    total = sum(counts.values())
-    return {k: v / total for k, v in counts.items()}
+    # ── Public transform ─────────────────────────────────────
 
-def mutual_information(seqs: List[str], i: int, j: int,
-                       marginals: List[Dict[str, float]]) -> float:
-    """
-    MI(Xᵢ, Xⱼ) = Σ_{a,b} P(a,b) log[ P(a,b) / (P(a) P(b)) ]
-    Returns MI in nats; always ≥ 0.
-    """
-    joint = _joint(seqs, i, j)
-    mi = 0.0
-    for a in BASES:
-        for b in BASES:
-            pab = joint.get((a, b), 1e-10)
-            pa  = marginals[i][a]
-            pb  = marginals[j][b]
-            if pab > 0 and pa > 0 and pb > 0:
-                mi += pab * math.log(pab / (pa * pb))
-    return max(mi, 0.0)
-
-def compute_mi_matrix(seqs: List[str], n: int) -> List[List[float]]:
-    """Compute the full n×n symmetric MI matrix."""
-    marginals = _marginals(seqs, n)
-    mi = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            m = mutual_information(seqs, i, j, marginals)
-            mi[i][j] = m
-            mi[j][i] = m
-    return mi
-
-# ─────────────────────────────────────────────────────────────
-# Chow-Liu: Maximum Spanning Tree → optimal tree-BN
-# ─────────────────────────────────────────────────────────────
-
-def chow_liu_tree(mi_matrix: List[List[float]], n: int,
-                   root: int = 0) -> List[int]:
-    """
-    Find the maximum spanning tree of the MI graph (Kruskal's algorithm).
-    Orient edges away from `root` (BFS).
-
-    Returns
-    -------
-    parents : List[int]
-        parents[i] = parent of node i; parents[root] = -1.
-    """
-    edges = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            edges.append((mi_matrix[i][j], i, j))
-    edges.sort(reverse=True)          # descending MI
-
-    uf  = _UnionFind(n)
-    adj: Dict[int, List[int]] = defaultdict(list)
-    for mi_val, u, v in edges:
-        if uf.union(u, v):
-            adj[u].append(v)
-            adj[v].append(u)
-
-    # BFS from root to orient edges
-    parents  = [-1] * n
-    visited  = [False] * n
-    queue    = deque([root])
-    visited[root] = True
-    while queue:
-        node = queue.popleft()
-        for nb in adj[node]:
-            if not visited[nb]:
-                visited[nb] = True
-                parents[nb] = node
-                queue.append(nb)
-
-    return parents
-
-# ─────────────────────────────────────────────────────────────
-# BN Parameter Learning (CPTs)
-# ─────────────────────────────────────────────────────────────
-
-def learn_cpts(seqs: List[str], parents: List[int], n: int
-               ) -> Tuple[Dict[str, float], List[Optional[Dict]]]:
-    """
-    Estimate conditional probability tables with Laplace smoothing.
-
-    Returns
-    -------
-    root_marginal : P(b) for the root node
-    cpt_list      : cpt_list[i][parent_base][child_base] = P(xᵢ=child | Pa(xᵢ)=parent)
-                    cpt_list[root] = None
-    """
-    root = next(i for i, p in enumerate(parents) if p == -1)
-
-    # Root marginal
-    r_counts = {b: PSEUDOCOUNT for b in BASES}
-    for seq in seqs:
-        b = seq[root]
-        if b in BASE_IDX:
-            r_counts[b] += 1
-    total_r = sum(r_counts.values())
-    root_marginal = {b: r_counts[b] / total_r for b in BASES}
-
-    # Conditional tables
-    cpt_list: List[Optional[Dict]] = [None] * n
-    for i in range(n):
-        p = parents[i]
-        if p == -1:
-            continue
-        cond: Dict[str, Dict[str, float]] = {
-            pa: {ch: PSEUDOCOUNT for ch in BASES} for pa in BASES
-        }
-        for seq in seqs:
-            pa_b, ch_b = seq[p], seq[i]
-            if pa_b in BASE_IDX and ch_b in BASE_IDX:
-                cond[pa_b][ch_b] += 1
-        cpt: Dict[str, Dict[str, float]] = {}
-        for pa_b in BASES:
-            total = sum(cond[pa_b].values())
-            cpt[pa_b] = {ch_b: cond[pa_b][ch_b] / total for ch_b in BASES}
-        cpt_list[i] = cpt
-
-    return root_marginal, cpt_list
-
-# ─────────────────────────────────────────────────────────────
-# BIC-based Greedy Structure Search (beyond tree)
-# ─────────────────────────────────────────────────────────────
-
-def _has_cycle(parents: List[int], n: int) -> bool:
-    """Detect directed cycle via topological sort."""
-    in_deg: List[int] = [0] * n
-    children: Dict[int, List[int]] = defaultdict(list)
-    for i, p in enumerate(parents):
-        if p != -1:
-            children[p].append(i)
-            in_deg[i] += 1
-    queue = deque(i for i in range(n) if in_deg[i] == 0)
-    count = 0
-    while queue:
-        node = queue.popleft()
-        count += 1
-        for ch in children[node]:
-            in_deg[ch] -= 1
-            if in_deg[ch] == 0:
-                queue.append(ch)
-    return count != n
-
-def _bic_score(seqs: List[str], parents: List[int], n: int) -> float:
-    """
-    BIC(G) = log P(D | G, θ̂) − (d_G / 2) × log N
-
-    d_G = Σᵢ (|Xᵢ| − 1) × |PA_i|
-        root: |X|−1 = 3  free params
-        other: (|X|−1) × |PA| = 3 × 4 = 12 free params
-    """
-    root_marg, cpt_list = learn_cpts(seqs, parents, n)
-    root = next(i for i, p in enumerate(parents) if p == -1)
-    N = len(seqs)
-    if N == 0:
-        return float('-inf')
-
-    # Log-likelihood
-    ll = 0.0
-    for seq in seqs:
-        for i in range(n):
-            b = seq[i]
-            if b not in BASE_IDX:
-                continue
-            p = parents[i]
-            if p == -1:
-                prob = root_marg.get(b, 1e-10)
+    def transform_one(self, seq: str) -> np.ndarray:
+        """Return feature vector for a single sequence string."""
+        parts = []
+        for ft in self.features:
+            if ft == 'one_hot':
+                parts.append(self._one_hot(seq))
+            elif ft == 'kmer2':
+                parts.append(self._kmer_freq(seq, 2))
+            elif ft == 'kmer3':
+                parts.append(self._kmer_freq(seq, 3))
+            elif ft == 'dinuc_pos':
+                parts.append(self._dinuc_pos(seq))
+            elif ft == 'pwm':
+                parts.append(self._pwm_scores(seq))
             else:
-                pb = seq[p]
-                prob = cpt_list[i][pb].get(b, 1e-10) if pb in BASE_IDX else 1e-10
-            ll += math.log(max(prob, 1e-10))
+                raise ValueError(f"Unknown feature type: {ft!r}")
+        return np.concatenate(parts)
 
-    # Free parameters
-    d = len(BASES) - 1  # root
-    for i in range(n):
-        if parents[i] != -1:
-            d += (len(BASES) - 1) * len(BASES)
+    def transform(self, seqs: List[str]) -> np.ndarray:
+        """Return feature matrix, shape (N, d)."""
+        return np.stack([self.transform_one(s) for s in seqs])
 
-    return ll - (d / 2.0) * math.log(N)
+    @property
+    def feature_dim(self) -> int:
+        """Total feature dimension."""
+        dim = 0
+        for ft in self.features:
+            if ft == 'one_hot':    dim += 4 * self.window
+            elif ft == 'kmer2':    dim += 16
+            elif ft == 'kmer3':    dim += 64
+            elif ft == 'dinuc_pos': dim += 16 * (self.window - 1)
+            elif ft == 'pwm':      dim += self.window
+        return dim
 
-def greedy_bic_search(seqs: List[str], n: int,
-                       max_parents: int = 2) -> List[int]:
+    def feature_names(self) -> List[str]:
+        """Human-readable name for each feature dimension."""
+        names = []
+        for ft in self.features:
+            if ft == 'one_hot':
+                for i in range(self.window):
+                    for b in BASES:
+                        names.append(f'oh_pos{i}_{b}')
+            elif ft == 'kmer2':
+                names += [f'k2_{k}' for k in self._kmers2]
+            elif ft == 'kmer3':
+                names += [f'k3_{k}' for k in self._kmers3]
+            elif ft == 'dinuc_pos':
+                for i in range(self.window - 1):
+                    for a in BASES:
+                        for b in BASES:
+                            names.append(f'dn_pos{i}_{a}{b}')
+            elif ft == 'pwm':
+                names += [f'pwm_pos{i}' for i in range(self.window)]
+        return names
+
+
+# ─────────────────────────────────────────────────────────────
+# SVM model
+# ─────────────────────────────────────────────────────────────
+
+class SVMSpliceSite:
     """
-    Hill-climbing structure search starting from the Chow-Liu tree.
-
-    At each step, tries:
-      (a) Adding an edge   u → i  (if i doesn't yet have max_parents parents)
-      (b) Removing an edge pa(i) → i
-      (c) Reversing an edge pa(i) → i  to  i → pa(i)
-
-    Stops when no single operation improves BIC.
+    SVM splice site predictor.
 
     Parameters
     ----------
-    max_parents : maximum in-degree per node (default 2, avoids CPT explosion)
-    """
-    mi_matrix = compute_mi_matrix(seqs, n)
-    parents   = chow_liu_tree(mi_matrix, n)
-    current   = _bic_score(seqs, parents, n)
-
-    improved = True
-    while improved:
-        improved = False
-        best_bic = current
-        best_cfg = None
-
-        for i in range(n):
-            pa_i = parents[i]
-            n_pa_i = sum(1 for p in parents if p != -1 and parents.index(p) == i
-                         ) if False else (0 if pa_i == -1 else 1)
-
-            # (a) Try adding an edge u→i
-            if n_pa_i < max_parents and pa_i == -1:
-                for u in range(n):
-                    if u == i:
-                        continue
-                    new_p = parents[:]
-                    new_p[i] = u
-                    if _has_cycle(new_p, n):
-                        continue
-                    bic = _bic_score(seqs, new_p, n)
-                    if bic > best_bic + 1e-6:
-                        best_bic = bic
-                        best_cfg = new_p[:]
-
-            # (b) Try removing edge pa_i→i
-            if pa_i != -1:
-                new_p = parents[:]
-                new_p[i] = -1
-                bic = _bic_score(seqs, new_p, n)
-                if bic > best_bic + 1e-6:
-                    best_bic = bic
-                    best_cfg = new_p[:]
-
-            # (c) Try reversing edge pa_i→i  to  i→pa_i
-            if pa_i != -1:
-                new_p = parents[:]
-                new_p[i]    = -1
-                new_p[pa_i] = i
-                if not _has_cycle(new_p, n):
-                    bic = _bic_score(seqs, new_p, n)
-                    if bic > best_bic + 1e-6:
-                        best_bic = bic
-                        best_cfg = new_p[:]
-
-        if best_cfg is not None:
-            parents  = best_cfg
-            current  = best_bic
-            improved = True
-
-    return parents
-
-# ─────────────────────────────────────────────────────────────
-# Main Model Class
-# ─────────────────────────────────────────────────────────────
-
-class BayesianNetworkModel:
-    """
-    Bayesian Network splice site predictor.
-
-    Structure options
-    -----------------
-    'chow-liu'   : optimal tree-BN (O(n²) MI computation + Kruskal)
-    'greedy-bic' : hill-climbing from Chow-Liu tree, allows multi-parent nodes
-    'chain'      : forced chain (= WAM structure, useful as ablation)
-    List[int]    : user-supplied parents list
-
-    Scoring
-    -------
-    log-odds(s) = log P(s | fg BN) − log P(s | bg BN)
+    window      : sequence window length
+    site        : 'donor' or 'acceptor'
+    kernel      : 'linear', 'rbf', 'poly', 'sigmoid'
+    feature_set : list of feature types (see FeatureExtractor)
+    C           : SVM regularisation (slack penalty)
+    gamma       : RBF/poly kernel width; 'scale' = 1/(n_features × X.var())
+    degree      : polynomial kernel degree
+    probability : if True, enable Platt scaling for probability estimates
     """
 
-    def __init__(self, window: int, site: str = 'donor',
-                 structure='chow-liu') -> None:
-        self.window    = window
-        self.site      = site
-        self.structure = structure
+    def __init__(self,
+                 window: int = DONOR_WINDOW,
+                 site: str = 'donor',
+                 kernel: str = 'rbf',
+                 feature_set: Union[str, List[str]] = 'combined',
+                 C: float = 1.0,
+                 gamma: Union[str, float] = 'scale',
+                 degree: int = 3,
+                 probability: bool = True) -> None:
+        self.window      = window
+        self.site        = site
+        self.kernel      = kernel
+        self.feature_set = feature_set
+        self.C           = C
+        self.gamma       = gamma
+        self.degree      = degree
+        self.probability = probability
 
-        self.parents:            Optional[List[int]]   = None
-        self.root_fg:            Optional[Dict]        = None
-        self.cpt_fg:             Optional[List]        = None
-        self.root_bg:            Optional[Dict]        = None
-        self.cpt_bg:             Optional[List]        = None
-        self.mi_matrix:          Optional[List[List[float]]] = None
-        self._marginals_fg:      Optional[List[Dict]]  = None
+        self.extractor: Optional[FeatureExtractor] = None
+        self.pipeline:  Optional[Pipeline]         = None
+        self._train_pos: Optional[List[str]]       = None
+        self._train_neg: Optional[List[str]]       = None
 
     # ── Training ─────────────────────────────────────────────
 
-    def train(self, pos_seqs: List[str], neg_seqs: List[str]) -> None:
+    def train(self, pos_seqs: List[str], neg_seqs: List[str]) -> 'SVMSpliceSite':
         """
-        Learn structure from positive sequences, then fit CPTs for
-        both foreground (pos) and background (neg) using the same graph.
+        Fit the SVM on positive (true splice sites) and negative sequences.
+
+        Internally builds:
+          FeatureExtractor (fit on pos) → StandardScaler → SVC
         """
         pos = validate_seqs(pos_seqs, self.window)
         neg = validate_seqs(neg_seqs, self.window)
         if not pos:
             raise ValueError("No valid positive sequences after filtering.")
+        self._train_pos = pos
+        self._train_neg = neg
 
-        n = self.window
+        self.extractor = FeatureExtractor(self.window, self.feature_set)
+        self.extractor.fit(pos)
 
-        # ── Structure learning ─────────────────────────────────
-        if isinstance(self.structure, list):
-            self.parents = list(self.structure)
+        X_pos = self.extractor.transform(pos)
+        X_neg = self.extractor.transform(neg)
+        X     = np.vstack([X_pos, X_neg])
+        y     = np.array([1]*len(pos) + [-1]*len(neg), dtype=int)
 
-        elif self.structure == 'chain':
-            self.parents = [-1] + list(range(n - 1))
+        svc = SVC(kernel=self.kernel, C=self.C, gamma=self.gamma,
+                  degree=self.degree, probability=self.probability,
+                  class_weight='balanced', random_state=42)
 
-        elif self.structure == 'chow-liu':
-            self.mi_matrix    = compute_mi_matrix(pos, n)
-            self.parents      = chow_liu_tree(self.mi_matrix, n, root=0)
-
-        elif self.structure == 'greedy-bic':
-            print("  Running BIC greedy search …")
-            self.parents = greedy_bic_search(pos, n)
-
-        else:
-            raise ValueError(f"Unknown structure: {self.structure!r}")
-
-        # ── Parameter learning ─────────────────────────────────
-        self._marginals_fg           = _marginals(pos, n)
-        self.root_fg, self.cpt_fg   = learn_cpts(pos, self.parents, n)
-        bg_seqs = neg if neg else pos
-        self.root_bg, self.cpt_bg   = learn_cpts(bg_seqs, self.parents, n)
+        self.pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('svm',    svc),
+        ])
+        self.pipeline.fit(X, y)
+        return self
 
     # ── Scoring ───────────────────────────────────────────────
 
-    def _log_prob(self, seq: str, root_marg: Dict,
-                  cpt: List) -> float:
-        """log P(seq | BN)."""
-        lp = 0.0
-        for i in range(self.window):
-            b = seq[i]
-            if b not in BASE_IDX:
-                return float('-inf')
-            pa = self.parents[i]
-            if pa == -1:
-                prob = root_marg.get(b, 1e-10)
-            else:
-                pb   = seq[pa]
-                prob = cpt[i][pb].get(b, 1e-10) if pb in BASE_IDX else 1e-10
-            lp += math.log(max(prob, 1e-10))
-        return lp
+    def _extract(self, seqs: Union[str, List[str]]) -> np.ndarray:
+        if isinstance(seqs, str):
+            seqs = [seqs]
+        seqs = [s.upper() for s in seqs]
+        return self.extractor.transform(seqs)
 
-    def score(self, seq: str) -> float:
-        """Log-odds score for a single window sequence."""
-        if self.parents is None:
-            raise RuntimeError("Model not trained. Call train() first.")
-        seq = seq.upper()
-        if len(seq) != self.window:
-            raise ValueError(f"Expected length {self.window}, got {len(seq)}")
-        return (self._log_prob(seq, self.root_fg, self.cpt_fg) -
-                self._log_prob(seq, self.root_bg, self.cpt_bg))
+    def decision_score(self, seq: str) -> float:
+        """
+        Return the signed distance to the decision hyperplane.
+        Positive → predicted splice site; negative → predicted non-site.
+        """
+        if self.pipeline is None:
+            raise RuntimeError("Call train() first.")
+        X = self._extract(seq)
+        return float(self.pipeline.decision_function(X)[0])
 
-    def score_batch(self, seqs: List[str]) -> List[float]:
-        return [self.score(s) for s in seqs]
+    def decision_score_batch(self, seqs: List[str]) -> List[float]:
+        if self.pipeline is None:
+            raise RuntimeError("Call train() first.")
+        X = self._extract(seqs)
+        return self.pipeline.decision_function(X).tolist()
 
     def predict(self, seq: str, threshold: float = 0.0) -> int:
-        return int(self.score(seq) >= threshold)
+        """Return +1 / −1."""
+        return int(self.decision_score(seq) >= threshold)
 
     def predict_batch(self, seqs: List[str],
                       threshold: float = 0.0) -> List[int]:
         return [self.predict(s, threshold) for s in seqs]
 
-    # ── Analysis ──────────────────────────────────────────────
+    def predict_proba(self, seq: str) -> float:
+        """P(splice site | seq) via Platt scaling (requires probability=True)."""
+        if not self.probability:
+            raise RuntimeError("Set probability=True at construction.")
+        X = self._extract(seq)
+        return float(self.pipeline.predict_proba(X)[0, 1])
 
-    def information_content(self) -> List[float]:
+    # ── Cross-validation ──────────────────────────────────────
+
+    def cross_validate(self, pos_seqs: List[str], neg_seqs: List[str],
+                       n_folds: int = 5) -> Dict[str, float]:
         """
-        Per-position IC (bits) against uniform background.
-        For non-root nodes: average over parent states.
+        Stratified k-fold CV on the combined dataset.
+        Returns mean ± std for AUC-ROC and MCC.
         """
-        if self.parents is None or self.root_fg is None:
-            raise RuntimeError("Not trained.")
-        bg = {b: 0.25 for b in BASES}
-        ic = []
-        for i in range(self.window):
-            pa = self.parents[i]
-            if pa == -1:
-                ic_i = sum(
-                    self.root_fg[b] * math.log2(max(self.root_fg[b], 1e-10) / bg[b])
-                    for b in BASES if self.root_fg[b] > 0
-                )
-            else:
-                ic_i = 0.0
-                for pa_b in BASES:
-                    for ch_b in BASES:
-                        p = self.cpt_fg[i][pa_b][ch_b]
-                        if p > 0:
-                            ic_i += 0.25 * p * math.log2(p / bg[ch_b])
-            ic.append(ic_i)
-        return ic
+        pos = validate_seqs(pos_seqs, self.window)
+        neg = validate_seqs(neg_seqs, self.window)
 
-    def non_adjacent_edges(self) -> List[Tuple[int, int]]:
-        """Return list of (child, parent) pairs where |child-parent| > 1."""
-        if self.parents is None:
-            return []
-        return [(i, p) for i, p in enumerate(self.parents)
-                if p != -1 and abs(i - p) > 1]
+        extractor = FeatureExtractor(self.window, self.feature_set).fit(pos)
+        X = np.vstack([extractor.transform(pos), extractor.transform(neg)])
+        y = np.array([1]*len(pos) + [-1]*len(neg), dtype=int)
 
-    def print_mi_matrix(self) -> None:
-        """Print the mutual information matrix as an ASCII heatmap."""
-        if self.mi_matrix is None:
-            print("MI matrix not available (only for Chow-Liu/greedy-BIC).")
-            return
-        n = self.window
-        print(f"\nMutual Information matrix ({self.site} site, window={n})")
-        print("    " + "".join(f" {j:5d}" for j in range(n)))
-        print("    " + "─" * (6 * n))
-        for i in range(n):
-            row = f"{i:>3} |"
-            for j in range(n):
-                v = self.mi_matrix[i][j]
-                if i == j:
-                    row += "   ─  "
-                elif v >= 0.3:
-                    row += f" {v:5.3f}"   # high MI
-                else:
-                    row += f" {v:5.3f}"
-            print(row)
+        svc = SVC(kernel=self.kernel, C=self.C, gamma=self.gamma,
+                  degree=self.degree, probability=True,
+                  class_weight='balanced', random_state=42)
+        pipe = Pipeline([('scaler', StandardScaler()), ('svm', svc)])
 
-    def print_summary(self) -> None:
-        """Full summary: structure, non-adjacent edges, IC per position."""
-        if self.parents is None:
-            print("Not trained.")
-            return
-        root = next(i for i, p in enumerate(self.parents) if p == -1)
-        non_adj = self.non_adjacent_edges()
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-        print(f"\nBayesian Network — {self.site} site  (window={self.window}, "
-              f"structure={self.structure})")
-        print("=" * 62)
-        print(f"Root: position {root}")
-        print(f"Edges learned: {self.window - 1}")
-        print(f"Non-adjacent edges (long-range): {len(non_adj)}  "
-              + (str([(f'{c}←{p}', f'gap={abs(c-p)}') for c,p in non_adj])
-                 if non_adj else "(none)"))
+        auc_scores = cross_val_score(pipe, X, y, cv=cv, scoring='roc_auc')
+        mcc_scores = cross_val_score(pipe, X, y, cv=cv, scoring='matthews_corrcoef')
+        f1_scores  = cross_val_score(pipe, X, y, cv=cv, scoring='f1')
 
-        ic = self.information_content()
-        print(f"\n{'Pos':>4}  {'Parent':>8}  {'IC (bits)':>10}  {'Edge type'}")
-        print("─" * 48)
-        for i, (pa, ic_val) in enumerate(zip(self.parents, ic)):
-            if pa == -1:
-                pa_str   = "root"
-                edge_typ = "—"
-            elif abs(i - pa) == 1:
-                pa_str   = str(pa)
-                edge_typ = "adjacent"
-            else:
-                pa_str   = str(pa)
-                edge_typ = f"LONG-RANGE gap={abs(i-pa)}"
-            print(f"{i:>4}  {pa_str:>8}  {ic_val:>10.4f}  {edge_typ}")
-        print("=" * 62)
+        return {
+            'auc_mean': float(auc_scores.mean()),
+            'auc_std':  float(auc_scores.std()),
+            'mcc_mean': float(mcc_scores.mean()),
+            'mcc_std':  float(mcc_scores.std()),
+            'f1_mean':  float(f1_scores.mean()),
+            'f1_std':   float(f1_scores.std()),
+        }
 
-# ─────────────────────────────────────────────────────────────
-# Genome Scanner
-# ─────────────────────────────────────────────────────────────
+    # ── Feature importance (linear kernel only) ───────────────
 
-class BNScanner:
-    """
-    Slide a BayesianNetworkModel over a genomic sequence.
-
-    site='donor'    → looks for GT at canonical position
-    site='acceptor' → looks for AG
-    """
-    DONOR_OFFSET    = 3   # GT starts at position 3 in 9-bp window
-    ACCEPTOR_OFFSET = 20  # AG starts at position 20 in 23-bp window
-
-    def __init__(self, model: BayesianNetworkModel,
-                 threshold: float = 0.0) -> None:
-        self.model     = model
-        self.threshold = threshold
-        self.site      = model.site
-        self.offset    = (self.DONOR_OFFSET if self.site == 'donor'
-                          else self.ACCEPTOR_OFFSET)
-        self.dinuc     = 'GT' if self.site == 'donor' else 'AG'
-
-    def scan(self, genome: str) -> List[Tuple[int, float]]:
+    def top_features(self, n: int = 15) -> List[Tuple[str, float]]:
         """
-        Return (dinucleotide_position, score) for every predicted site.
-        Filters by canonical GT/AG dinucleotide before scoring.
+        Return the top-n most discriminative features by |weight|.
+        Only meaningful for linear kernel.
         """
-        genome = genome.upper()
-        w      = self.model.window
-        off    = self.offset
+        if self.pipeline is None:
+            raise RuntimeError("Call train() first.")
+        if self.kernel != 'linear':
+            raise ValueError("Feature weights are only interpretable for linear kernel.")
+        svm     = self.pipeline.named_steps['svm']
+        weights = svm.coef_[0]                   # shape (d,)
+        names   = self.extractor.feature_names()
+        ranked  = sorted(zip(names, weights.tolist()),
+                         key=lambda x: abs(x[1]), reverse=True)
+        return ranked[:n]
+
+    # ── Genome scanner ────────────────────────────────────────
+
+    def scan(self, genome: str, threshold: float = 0.0
+             ) -> List[Tuple[int, float]]:
+        """
+        Slide the SVM over a genome string.
+        Returns (canonical_dinucleotide_position, decision_score) for hits.
+        """
+        genome  = genome.upper()
+        w       = self.window
+        dinuc   = 'GT' if self.site == 'donor' else 'AG'
+        off     = DONOR_GT_POS if self.site == 'donor' else ACCEPTOR_AG_POS
         hits: List[Tuple[int, float]] = []
         for i in range(off, len(genome) - w + off + 1):
             win = genome[i - off: i - off + w]
             if len(win) != w:
                 continue
-            if win[off: off + 2] != self.dinuc:
+            if win[off: off + 2] != dinuc:
                 continue
-            sc = self.model.score(win)
-            if sc >= self.threshold:
+            sc = self.decision_score(win)
+            if sc >= threshold:
                 hits.append((i, sc))
         return hits
 
-# ─────────────────────────────────────────────────────────────
-# Baseline models (WMM and WAM, for comparison)
-# ─────────────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────
 
-class _WMMModel:
-    """Zero-order position weight matrix (baseline)."""
+    def print_summary(self) -> None:
+        if self.pipeline is None:
+            print("Not trained.")
+            return
+        svm = self.pipeline.named_steps['svm']
+        n_sv = svm.n_support_.sum()
+        dim  = self.extractor.feature_dim
 
-    def __init__(self, window: int) -> None:
-        self.window   = window
-        self.log_odds: Optional[List[Dict[str, float]]] = None
+        print(f"\nSVM Splice Site Predictor — {self.site} site")
+        print("=" * 52)
+        print(f"  Window      : {self.window} bp")
+        print(f"  Kernel      : {self.kernel}")
+        print(f"  C           : {self.C}")
+        print(f"  Gamma       : {self.gamma}")
+        print(f"  Features    : {', '.join(self.extractor.features)}")
+        print(f"  Feature dim : {dim}")
+        print(f"  Support vecs: {n_sv}")
+        if self.kernel == 'linear':
+            svm_weights = svm.coef_[0]
+            print(f"  ‖w‖₂        : {float(np.linalg.norm(svm_weights)):.4f}")
+            print(f"  Margin width: {2.0 / float(np.linalg.norm(svm_weights)):.4f}")
+        print("=" * 52)
 
-    def train(self, pos_seqs: List[str], neg_seqs: List[str]) -> None:
-        pos = validate_seqs(pos_seqs, self.window)
-        n   = self.window
-        bg  = empirical_bg(neg_seqs) if neg_seqs else {b: 0.25 for b in BASES}
-        cts = [{b: PSEUDOCOUNT for b in BASES} for _ in range(n)]
-        for seq in pos:
-            for i, c in enumerate(seq):
-                cts[i][c] += 1
-        self.log_odds = []
-        for pos_ct in cts:
-            total = sum(pos_ct.values())
-            freq  = {b: pos_ct[b] / total for b in BASES}
-            self.log_odds.append(
-                {b: math.log(max(freq[b], 1e-10) / max(bg[b], 1e-10))
-                 for b in BASES}
-            )
-
-    def score(self, seq: str) -> float:
-        seq = seq.upper()
-        return sum(self.log_odds[i].get(c, 0.0)
-                   for i, c in enumerate(seq) if c in BASE_IDX)
-
-    def score_batch(self, seqs: List[str]) -> List[float]:
-        return [self.score(s) for s in seqs]
-
-
-class _WAMModel:
-    """First-order Markov (chain BN = WAM) for comparison."""
-
-    def __init__(self, window: int) -> None:
-        self.window = window
-        self._bn    = BayesianNetworkModel(window, structure='chain')
-
-    def train(self, pos_seqs: List[str], neg_seqs: List[str]) -> None:
-        self._bn.train(pos_seqs, neg_seqs)
-
-    def score(self, seq: str) -> float:
-        return self._bn.score(seq)
-
-    def score_batch(self, seqs: List[str]) -> List[float]:
-        return self._bn.score_batch(seqs)
 
 # ─────────────────────────────────────────────────────────────
-# Evaluation
-# ─────────────────────────────────────────────────────────────
-
-def evaluate(y_true: List[int], y_pred: List[int]) -> Dict[str, float]:
-    tp = sum(t == p == 1 for t, p in zip(y_true, y_pred))
-    fp = sum(t == 0 and p == 1 for t, p in zip(y_true, y_pred))
-    tn = sum(t == p == 0 for t, p in zip(y_true, y_pred))
-    fn = sum(t == 1 and p == 0 for t, p in zip(y_true, y_pred))
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    f1   = 2 * prec * sens / (prec + sens) if (prec + sens) > 0 else 0.0
-    denom = math.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
-    mcc  = (tp*tn - fp*fn) / denom if denom > 0 else 0.0
-    return dict(TP=tp, FP=fp, TN=tn, FN=fn,
-                sensitivity=sens, specificity=spec,
-                precision=prec, F1=f1, MCC=mcc)
-
-def roc_auc(y_true: List[int], scores: List[float],
-            n_thr: int = 200) -> Tuple[List[float], List[float], float]:
-    thresholds = sorted(set(scores), reverse=True)
-    step       = max(1, len(thresholds) // n_thr)
-    thresholds = thresholds[::step]
-    fpr, tpr   = [0.0], [0.0]
-    for thr in thresholds:
-        pred = [int(s >= thr) for s in scores]
-        m    = evaluate(y_true, pred)
-        fpr.append(1.0 - m['specificity'])
-        tpr.append(m['sensitivity'])
-    fpr.append(1.0); tpr.append(1.0)
-    auc = sum((fpr[i] - fpr[i-1]) * (tpr[i] + tpr[i-1]) / 2
-              for i in range(1, len(fpr)))
-    return fpr, tpr, auc
-
-# ─────────────────────────────────────────────────────────────
-# Synthetic dataset (same generator as wam_splice_site.py)
+# Synthetic dataset (matches wam_splice_site.py / bayesian_network_splice.py)
 # ─────────────────────────────────────────────────────────────
 
 def _rand(weights: Dict[str, float]) -> str:
-    r = random.random()
-    cum = 0.0
+    r, cum = random.random(), 0.0
     for b, w in weights.items():
         cum += w
         if r < cum:
@@ -717,32 +479,22 @@ def _rand(weights: Dict[str, float]) -> str:
     return 'A'
 
 def make_donor_positive(n: int = 500) -> List[str]:
-    """
-    Synthetic 9-bp donor windows with biological covariance:
-    - Strong GT at positions 3-4 (100%)
-    - Purines preferred at -3 (pos 0) and +3 (pos 5)
-    - A preferred at +4 (pos 6)
-    - Covariation: if pos 0 = A then pos 2 biased toward G (mimics real correlation)
-    """
     seqs = []
     for _ in range(n):
         p0 = _rand({'A': 0.35, 'G': 0.35, 'C': 0.15, 'T': 0.15})
         p1 = _rand({'A': 0.45, 'G': 0.35, 'C': 0.10, 'T': 0.10})
-        # p2 correlates with p0 (long-range)
-        p2 = ('G' if p0 in ('A', 'G') and random.random() < 0.7
-              else _rand({'A': 0.2, 'G': 0.5, 'C': 0.15, 'T': 0.15}))
-        p3, p4 = 'G', 'T'            # canonical GT
+        p2 = ('G' if p0 in ('A', 'G') and random.random() < 0.70
+              else _rand({'A': 0.20, 'G': 0.50, 'C': 0.15, 'T': 0.15}))
+        p3, p4 = 'G', 'T'
         p5 = _rand({'A': 0.65, 'G': 0.15, 'C': 0.10, 'T': 0.10})
         p6 = _rand({'A': 0.70, 'G': 0.10, 'C': 0.10, 'T': 0.10})
         p7 = _rand({'A': 0.10, 'G': 0.65, 'C': 0.10, 'T': 0.15})
-        # p8 correlates with p5 (long-range)
         p8 = ('T' if p5 == 'A' and random.random() < 0.75
-              else _rand({'A': 0.1, 'G': 0.1, 'C': 0.1, 'T': 0.7}))
+              else _rand({'A': 0.10, 'G': 0.10, 'C': 0.10, 'T': 0.70}))
         seqs.append(''.join([p0, p1, p2, p3, p4, p5, p6, p7, p8]))
     return seqs
 
 def make_donor_negative(n: int = 500) -> List[str]:
-    """Random sequences with GT at positions 3-4 (pseudo-decoys)."""
     seqs = []
     while len(seqs) < n:
         s = list(''.join(random.choices(list(BASES), k=9)))
@@ -750,125 +502,310 @@ def make_donor_negative(n: int = 500) -> List[str]:
         seqs.append(''.join(s))
     return seqs
 
+
 # ─────────────────────────────────────────────────────────────
-# Comparison runner
+# Evaluation helpers
 # ─────────────────────────────────────────────────────────────
 
-def compare_models(train_pos: List[str], train_neg: List[str],
-                   test_pos: List[str],  test_neg: List[str],
-                   window: int = DONOR_WINDOW,
-                   threshold: float = 0.0) -> None:
-    """Train WMM, WAM, BN (Chow-Liu), and BN (greedy-BIC); compare on test set."""
+def evaluate_full(y_true: List[int], y_pred: List[int],
+                  scores: Optional[List[float]] = None) -> Dict[str, float]:
+    """Compute TP/FP/TN/FN + derived metrics. y labels: +1 / −1."""
+    yt = np.array(y_true)
+    yp = np.array(y_pred)
+    tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[-1, 1]).ravel()
+    sens  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    spec  = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    prec  = precision_score(yt, yp, pos_label=1, zero_division=0)
+    f1    = f1_score(yt, yp, pos_label=1, zero_division=0)
+    mcc   = matthews_corrcoef(yt, yp)
+    auc   = roc_auc_score(yt, scores) if scores is not None else float('nan')
+    return dict(TP=int(tp), FP=int(fp), TN=int(tn), FN=int(fn),
+                sensitivity=float(sens), specificity=float(spec),
+                precision=float(prec), F1=float(f1), MCC=float(mcc), AUC=float(auc))
+
+
+# ─────────────────────────────────────────────────────────────
+# Feature ablation study
+# ─────────────────────────────────────────────────────────────
+
+def ablation_study(train_pos: List[str], train_neg: List[str],
+                   test_pos: List[str],   test_neg: List[str],
+                   window: int = DONOR_WINDOW) -> None:
+    """
+    Compare different feature combinations with RBF-SVM.
+    Shows which feature types contribute most to performance.
+    """
+    configs = [
+        ('One-hot only',           ['one_hot']),
+        ('k-mer (2+3)',            ['kmer2', 'kmer3']),
+        ('Dinuc positional',       ['dinuc_pos']),
+        ('PWM log-odds',           ['pwm']),
+        ('One-hot + k-mer',        ['one_hot', 'kmer2', 'kmer3']),
+        ('One-hot + dinuc + PWM',  ['one_hot', 'dinuc_pos', 'pwm']),
+        ('Combined (all)',          list(FeatureExtractor.ALL_FEATURES)),
+    ]
+
+    test_seqs   = test_pos + test_neg
+    test_labels = [1]*len(test_pos) + [-1]*len(test_neg)
+
+    print("\n── Feature ablation (RBF-SVM, C=1.0) ────────────────────")
+    print(f"{'Feature set':<30} {'Dim':>5} {'AUC-ROC':>9} {'MCC':>9} {'F1':>9}")
+    print("─" * 66)
+
+    for name, fts in configs:
+        m = SVMSpliceSite(window=window, kernel='rbf', C=1.0, feature_set=fts)
+        m.train(train_pos, train_neg)
+        scores = m.decision_score_batch(test_seqs)
+        preds  = [1 if s >= 0 else -1 for s in scores]
+        met    = evaluate_full(test_labels, preds, scores)
+        dim    = m.extractor.feature_dim
+        print(f"  {name:<28} {dim:>5} {met['AUC']:>9.4f} {met['MCC']:>9.4f}"
+              f" {met['F1']:>9.4f}")
+
+    print("─" * 66)
+
+
+# ─────────────────────────────────────────────────────────────
+# Kernel comparison
+# ─────────────────────────────────────────────────────────────
+
+def kernel_comparison(train_pos: List[str], train_neg: List[str],
+                      test_pos: List[str],  test_neg: List[str],
+                      window: int = DONOR_WINDOW) -> None:
+    """Compare linear / RBF / polynomial kernel SVMs."""
+    kernels = [
+        ('Linear',      dict(kernel='linear', C=1.0)),
+        ('RBF C=0.1',   dict(kernel='rbf',    C=0.1,  gamma='scale')),
+        ('RBF C=1.0',   dict(kernel='rbf',    C=1.0,  gamma='scale')),
+        ('RBF C=10',    dict(kernel='rbf',    C=10.0, gamma='scale')),
+        ('Poly d=2',    dict(kernel='poly',   C=1.0,  degree=2)),
+        ('Poly d=3',    dict(kernel='poly',   C=1.0,  degree=3)),
+    ]
+
+    test_seqs   = test_pos + test_neg
+    test_labels = [1]*len(test_pos) + [-1]*len(test_neg)
+
+    print("\n── Kernel comparison (combined features) ─────────────────")
+    print(f"{'Kernel / C':^18} {'Sens':>8} {'Spec':>8} {'AUC':>8} {'MCC':>8} {'F1':>8}")
+    print("─" * 66)
+
+    for name, kwargs in kernels:
+        m = SVMSpliceSite(window=window,
+                          feature_set=list(FeatureExtractor.ALL_FEATURES),
+                          **kwargs)
+        m.train(train_pos, train_neg)
+        scores = m.decision_score_batch(test_seqs)
+        preds  = [1 if s >= 0 else -1 for s in scores]
+        met    = evaluate_full(test_labels, preds, scores)
+        print(f"  {name:<16} {met['sensitivity']:>8.4f} {met['specificity']:>8.4f}"
+              f" {met['AUC']:>8.4f} {met['MCC']:>8.4f} {met['F1']:>8.4f}")
+
+    print("─" * 66)
+
+
+# ─────────────────────────────────────────────────────────────
+# Four-way comparison: WMM / WAM / BN / SVM
+# ─────────────────────────────────────────────────────────────
+
+def _build_probabilistic_models(train_pos, train_neg, window):
+    """Build WMM and WAM baseline models (pure Python, no sklearn dep)."""
+
+    class _PWM:
+        def __init__(self, w):
+            self.w = w; self.lo = None
+        def train(self, pos, neg):
+            n  = self.w
+            bg = {b: 0.25 for b in BASES}
+            ct = [{b: PSEUDOCOUNT for b in BASES} for _ in range(n)]
+            for s in validate_seqs(pos, n):
+                for i, c in enumerate(s):
+                    ct[i][c] += 1
+            self.lo = []
+            for d in ct:
+                tot = sum(d.values())
+                self.lo.append({b: math.log(max(d[b]/tot, 1e-10)/bg[b]) for b in BASES})
+        def score(self, seq):
+            return sum(self.lo[i].get(c, 0) for i, c in enumerate(seq.upper()) if c in BASE_IDX)
+        def score_batch(self, seqs):
+            return [self.score(s) for s in seqs]
+
+    class _WAM:
+        def __init__(self, w):
+            self.w = w; self.first = None; self.cpt = None
+        def train(self, pos, neg):
+            valid = validate_seqs(pos, self.w)
+            bg    = {b: 0.25 for b in BASES}
+            fc = {b: PSEUDOCOUNT for b in BASES}
+            for s in valid: fc[s[0]] += 1
+            tot = sum(fc.values())
+            self.first = {b: fc[b]/tot for b in BASES}
+            cond = [{p: {c: PSEUDOCOUNT for c in BASES} for p in BASES}
+                    for _ in range(self.w)]
+            for s in valid:
+                for i in range(1, self.w):
+                    cond[i][s[i-1]][s[i]] += 1
+            self.cpt = []
+            for i, d in enumerate(cond):
+                row = {}
+                for p in BASES:
+                    t = sum(d[p].values())
+                    row[p] = {c: d[p][c]/t for c in BASES}
+                self.cpt.append(row)
+        def score(self, seq):
+            seq = seq.upper()
+            s   = math.log(max(self.first.get(seq[0], 1e-10), 1e-10) / 0.25)
+            for i in range(1, self.w):
+                p = self.cpt[i][seq[i-1]][seq[i]]
+                s += math.log(max(p, 1e-10) / 0.25)
+            return s
+        def score_batch(self, seqs):
+            return [self.score(s) for s in seqs]
+
+    wmm = _PWM(window);  wmm.train(train_pos, train_neg)
+    wam = _WAM(window);  wam.train(train_pos, train_neg)
+    return wmm, wam
+
+
+def four_way_comparison(train_pos: List[str], train_neg: List[str],
+                        test_pos: List[str],  test_neg: List[str],
+                        window: int = DONOR_WINDOW) -> None:
+    """Full comparison: WMM, WAM, BN Chow-Liu, SVM (RBF, combined features)."""
+
+    test_seqs   = test_pos + test_neg
+    test_labels_pm1 = [1]*len(test_pos) + [-1]*len(test_neg)   # ±1 for SVM
+    test_labels_01  = [1]*len(test_pos) + [0]*len(test_neg)    # 0/1 for BN
+
+    wmm, wam = _build_probabilistic_models(train_pos, train_neg, window)
+
+    # Try to import BN model from companion file
+    bn_scores = None
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from bayesian_network_splice import BayesianNetworkModel, validate_seqs as bn_val
+        bn = BayesianNetworkModel(window=window, site='donor', structure='chow-liu')
+        bn.train(train_pos, train_neg)
+        bn_scores = bn.score_batch(test_seqs)
+    except ImportError:
+        pass
+
+    svm = SVMSpliceSite(window=window, kernel='rbf', C=1.0,
+                         feature_set=list(FeatureExtractor.ALL_FEATURES))
+    svm.train(train_pos, train_neg)
+
+    wmm_sc  = wmm.score_batch(test_seqs)
+    wam_sc  = wam.score_batch(test_seqs)
+    svm_sc  = svm.decision_score_batch(test_seqs)
 
     models = [
-        ("WMM",          _WMMModel(window)),
-        ("WAM",          _WAMModel(window)),
-        ("BN Chow-Liu",  BayesianNetworkModel(window, site='donor',
-                                               structure='chow-liu')),
-        ("BN greedy-BIC",BayesianNetworkModel(window, site='donor',
-                                               structure='greedy-bic')),
+        ('WMM',          wmm_sc,  test_labels_pm1),
+        ('WAM',          wam_sc,  test_labels_pm1),
+    ]
+    if bn_scores is not None:
+        models.append(('BN Chow-Liu', bn_scores, test_labels_pm1))
+    models.append(('SVM (RBF)', svm_sc, test_labels_pm1))
+
+    print("\n" + "=" * 68)
+    print("  Four-way comparison — Donor Site Prediction")
+    print("=" * 68)
+    print(f"  {'Metric':<16}", end="")
+    for name, _, _ in models:
+        print(f"{name:>14}", end="")
+    print()
+    print("  " + "─" * 64)
+
+    rows = [
+        ('Sensitivity', 'sensitivity'),
+        ('Specificity', 'specificity'),
+        ('Precision',   'precision'),
+        ('F1 score',    'F1'),
+        ('MCC',         'MCC'),
+        ('AUC-ROC',     'AUC'),
     ]
 
-    print("\nTraining models …")
-    for name, m in models:
-        print(f"  {name} …", end=" ", flush=True)
-        m.train(train_pos, train_neg)
-        print("done")
+    all_mets = []
+    for _, sc, lbl in models:
+        threshold = 0.0
+        preds = [1 if s >= threshold else -1 for s in sc]
+        all_mets.append(evaluate_full(lbl, preds, sc))
 
-    test_seqs   = test_pos  + test_neg
-    test_labels = [1]*len(test_pos) + [0]*len(test_neg)
-
-    print("\n" + "=" * 70)
-    print("  WMM / WAM / BN Chow-Liu / BN greedy-BIC  — Donor Site Prediction")
-    print("=" * 70)
-    hdr = f"{'Metric':<20}" + "".join(f"{n:>15}" for n, _ in models)
-    print(hdr)
-    print("─" * 80)
-
-    result_rows: List[List] = []
-    aucs = []
-    for name, m in models:
-        scores = m.score_batch(test_seqs)
-        preds  = [int(s >= threshold) for s in scores]
-        met    = evaluate(test_labels, preds)
-        _, _, auc = roc_auc(test_labels, scores)
-        result_rows.append((met, auc))
-        aucs.append(auc)
-
-    metrics_to_show = [
-        ("Sensitivity",   "sensitivity"),
-        ("Specificity",   "specificity"),
-        ("Precision",     "precision"),
-        ("F1 score",      "F1"),
-        ("MCC",           "MCC"),
-        ("AUC-ROC",       None),
-    ]
-    for label, key in metrics_to_show:
-        if key is None:
-            vals = aucs
-        else:
-            vals = [row[0][key] for row in result_rows]
+    for label, key in rows:
+        vals = [m[key] for m in all_mets]
         best = max(vals)
-        row  = f"  {label:<18}"
+        print(f"  {label:<16}", end="")
         for v in vals:
-            row += f"{v:>13.4f}" + ("◀" if abs(v - best) < 1e-6 else " ")
-        print(row)
+            mark = "◀" if abs(v - best) < 1e-6 else " "
+            print(f"{v:>13.4f}{mark}", end="")
+        print()
 
-    print("─" * 80)
+    print("  " + "─" * 64)
     print("  ◀ = best in row")
-    print("=" * 70)
+    print("=" * 68)
 
-    # Show BN structure details
-    bn_cl = models[2][1]
-    bn_cl.print_summary()
-
-    non_adj = bn_cl.non_adjacent_edges()
-    if non_adj:
-        print(f"\n  Long-range edges discovered by Chow-Liu (not captured by WAM):")
-        for child, parent in non_adj:
-            mi_val = bn_cl.mi_matrix[child][parent] if bn_cl.mi_matrix else float('nan')
-            print(f"    pos {parent} → pos {child}  "
-                  f"gap={abs(child-parent)}  MI={mi_val:.4f} nats")
 
 # ─────────────────────────────────────────────────────────────
-# Demo
+# Main demo
 # ─────────────────────────────────────────────────────────────
 
 def demo() -> None:
-    """Self-contained demo using synthetic data."""
+    """Self-contained demo with synthetic data (same seed as companion files)."""
     random.seed(42)
+    np.random.seed(42)
 
     print("=" * 60)
-    print("  Bayesian Network Splice Site Predictor — Demo")
+    print("  SVM Splice Site Predictor — Demo")
     print("=" * 60)
-    print("Generating synthetic donor-site dataset with")
-    print("embedded long-range covariation (pos 0↔2, pos 5↔8) …\n")
+    print("Generating synthetic donor dataset (1000 pos / 1000 neg) …\n")
 
     all_pos = make_donor_positive(1000)
     all_neg = make_donor_negative(1000)
     split   = 800
 
-    compare_models(
-        train_pos=all_pos[:split],  train_neg=all_neg[:split],
-        test_pos=all_pos[split:],   test_neg=all_neg[split:],
-    )
+    train_pos, test_pos = all_pos[:split], all_pos[split:]
+    train_neg, test_neg = all_neg[:split], all_neg[split:]
 
-    # ── MI matrix heatmap ──────────────────────────────────────
-    bn = BayesianNetworkModel(window=DONOR_WINDOW, site='donor',
-                               structure='chow-liu')
-    bn.train(all_pos[:split], all_neg[:split])
-    bn.print_mi_matrix()
+    # ── 1. Feature ablation ────────────────────────────────────
+    ablation_study(train_pos, train_neg, test_pos, test_neg)
 
-    # ── Genome scan ────────────────────────────────────────────
-    print("\n── Genome scan demo ─────────────────────────────────────")
-    scanner = BNScanner(bn, threshold=1.5)
-    genome  = ("ATCGATCGATCG"
-               "CAGGTAAGTATCG"   # planted donor 1 @ offset 12
-               "GCATCGATCGATCG"
-               "AAGGTAAGTGCTA"   # planted donor 2 @ offset 39
-               "TTTGCATCGATCG")
-    hits = scanner.scan(genome)
-    print(f"Genome: {len(genome)} bp | threshold={scanner.threshold}")
+    # ── 2. Kernel comparison ───────────────────────────────────
+    kernel_comparison(train_pos, train_neg, test_pos, test_neg)
+
+    # ── 3. Four-way model comparison ──────────────────────────
+    four_way_comparison(train_pos, train_neg, test_pos, test_neg)
+
+    # ── 4. Linear SVM: top features ───────────────────────────
+    print("\n── Linear SVM — top 12 discriminative features ───────────")
+    lin = SVMSpliceSite(window=DONOR_WINDOW, kernel='linear', C=1.0,
+                         feature_set=list(FeatureExtractor.ALL_FEATURES))
+    lin.train(train_pos, train_neg)
+    lin.print_summary()
+    top = lin.top_features(12)
+    print(f"\n  {'Feature':<26} {'Weight':>10}")
+    print("  " + "─" * 38)
+    for name, w in top:
+        bar = "+" * min(int(abs(w) * 6), 20) if w > 0 else "-" * min(int(abs(w) * 6), 20)
+        sign = "+" if w > 0 else " "
+        print(f"  {name:<26} {sign}{abs(w):>8.4f}  {bar}")
+
+    # ── 5. 5-fold CV on best model ────────────────────────────
+    print("\n── 5-fold cross-validation (RBF, combined features) ──────")
+    rbf = SVMSpliceSite(window=DONOR_WINDOW, kernel='rbf', C=1.0,
+                         feature_set=list(FeatureExtractor.ALL_FEATURES))
+    cv_res = rbf.cross_validate(all_pos, all_neg, n_folds=5)
+    print(f"  AUC-ROC : {cv_res['auc_mean']:.4f} ± {cv_res['auc_std']:.4f}")
+    print(f"  MCC     : {cv_res['mcc_mean']:.4f} ± {cv_res['mcc_std']:.4f}")
+    print(f"  F1      : {cv_res['f1_mean']:.4f}  ± {cv_res['f1_std']:.4f}")
+
+    # ── 6. Genome scan ─────────────────────────────────────────
+    print("\n── Genome scan demo (RBF-SVM, threshold=0.5) ─────────────")
+    rbf.train(train_pos, train_neg)
+    genome = ("ATCGATCGATCG"
+              "CAGGTAAGTATCG"
+              "GCATCGATCGATCG"
+              "AAGGTAAGTGCTA"
+              "TTTGCATCGATCG")
+    hits = rbf.scan(genome, threshold=0.5)
+    print(f"  Genome: {len(genome)} bp | threshold=0.5")
     for pos, sc in hits:
         ctx = genome[max(0, pos-2): pos+5]
         print(f"  pos={pos:>4}  score={sc:+.3f}  context: …{ctx}…")
