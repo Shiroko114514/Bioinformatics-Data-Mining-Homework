@@ -1,7 +1,5 @@
 # SVM Splice Site Predictor
 
-# SVM Splice Site Predictor
-
 ## 使用方法
 
 ### 1. 训练模型
@@ -42,7 +40,6 @@ python3 predict.py "ATCGATCGATCGAAGGTAAGTATCGGCATCGATCGATCG" svm_splice_site.pkl
 - `splice_model.py`：SVM 模型训练、预测、扫描
 - `splice_eval.py`：消融实验和模型对比
 - `splice_main.py`：主入口 demo
-- `svm_splice_site.py`：兼容入口，保留旧导入方式
 - `splice_utils.py`：公共常量和工具函数
 
 ## 说明
