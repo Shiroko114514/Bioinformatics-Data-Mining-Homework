@@ -10,7 +10,13 @@ DEFAULT_THRESHOLD = 0.0
 
 
 def load_model(model_path: Union[str, Path] = DEFAULT_MODEL_PATH) -> SVMSpliceSite:
-    with Path(model_path).open("rb") as f:
+    path = Path(model_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Model file not found: {path}. Run wrapper.py first or pass an explicit model path."
+        )
+
+    with path.open("rb") as f:
         model = pickle.load(f)
     if not isinstance(model, SVMSpliceSite):
         raise TypeError("Loaded object is not an SVMSpliceSite model.")

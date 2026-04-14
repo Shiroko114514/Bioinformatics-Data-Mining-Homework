@@ -11,6 +11,8 @@ cd "Task3 Svm splice site"
 python3 wrapper.py
 ```
 
+训练过程使用真实数据集中的 donor 位点与对应负样本，并在生成负样本时保持数量平衡；如果数据不足，程序会直接报错而不是静默返回不完整结果。
+
 ### 2. 预测序列
 
 运行 `python predict.py "<DNA序列>" [模型路径] [阈值]`。
@@ -26,6 +28,8 @@ python3 predict.py "ATCGATCGATCGAAGGTAAGTATCGGCATCGATCGATCG"
 ```bash
 python3 predict.py "ATCGATCGATCGAAGGTAAGTATCGGCATCGATCGATCG" svm_splice_site.pkl 0.0
 ```
+
+如果模型文件不存在，程序会提示先运行 `wrapper.py`。
 
 ### 3. 输出内容
 
@@ -47,6 +51,8 @@ python3 predict.py "ATCGATCGATCGAAGGTAAGTATCGGCATCGATCGATCG" svm_splice_site.pkl
 - 默认 donor 窗口长度为 `9`，其中 `GT` 位于窗口位置 `3-4`
 - 默认 acceptor 窗口长度为 `23`，其中 `AG` 位于窗口位置 `20-21`
 - 代码依赖 `numpy` 和 `scikit-learn`
+- `cross_validate()` 会在每一折内重新拟合特征提取器和分类器，避免 PWM 特征泄漏到验证折中
+- `make_donor_negative()` 仅用于合成负样本，不会生成包含 donor `GT` 模式的窗口
 
 ## 额外入口
 

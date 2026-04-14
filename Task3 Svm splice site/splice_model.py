@@ -1,11 +1,11 @@
 from typing import Dict, List, Literal, Optional, Tuple, Union, cast
 
 import numpy as np
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
-from sklearn.metrics import matthews_corrcoef, make_scorer
+from sklearn.metrics import f1_score, matthews_corrcoef, roc_auc_score
 
 from splice_features import FeatureExtractor
 from splice_utils import ACCEPTOR_AG_POS, DONOR_GT_POS, DONOR_WINDOW, validate_seqs
@@ -108,34 +108,56 @@ class SVMSpliceSite:
         pos = validate_seqs(pos_seqs, self.window)
         neg = validate_seqs(neg_seqs, self.window)
 
-        extractor = FeatureExtractor(self.window, self.feature_set).fit(pos)
-        X = np.vstack([extractor.transform(pos), extractor.transform(neg)])
-        y = np.array([1] * len(pos) + [-1] * len(neg), dtype=int)
+        if len(pos) < n_folds or len(neg) < n_folds:
+            raise ValueError("Not enough samples for the requested number of folds.")
 
-        svc = SVC(
-            kernel=cast(Literal["linear", "rbf", "poly", "sigmoid", "precomputed"], self.kernel),
-            C=self.C,
-            gamma=cast(Union[float, Literal["scale", "auto"]], self.gamma),
-            degree=self.degree,
-            probability=True,
-            class_weight="balanced",
-            random_state=42,
-        )
-        pipe = Pipeline([("scaler", StandardScaler()), ("svm", svc)])
+        all_seqs = pos + neg
+        y = np.array([1] * len(pos) + [-1] * len(neg), dtype=int)
 
         cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-        auc_scores = cross_val_score(pipe, X, y, cv=cv, scoring="roc_auc")
-        mcc_scores = cross_val_score(pipe, X, y, cv=cv, scoring=make_scorer(matthews_corrcoef))
-        f1_scores = cross_val_score(pipe, X, y, cv=cv, scoring="f1")
+        auc_scores: List[float] = []
+        mcc_scores: List[float] = []
+        f1_scores: List[float] = []
+
+        for train_idx, test_idx in cv.split(all_seqs, y):
+            train_seqs = [all_seqs[i] for i in train_idx]
+            test_seqs = [all_seqs[i] for i in test_idx]
+            train_labels = y[train_idx]
+            test_labels = y[test_idx]
+
+            train_pos_fold = [seq for seq, label in zip(train_seqs, train_labels) if label == 1]
+            extractor = FeatureExtractor(self.window, self.feature_set).fit(train_pos_fold)
+
+            X_train = extractor.transform(train_seqs)
+            X_test = extractor.transform(test_seqs)
+
+            svc = SVC(
+                kernel=cast(Literal["linear", "rbf", "poly", "sigmoid", "precomputed"], self.kernel),
+                C=self.C,
+                gamma=cast(Union[float, Literal["scale", "auto"]], self.gamma),
+                degree=self.degree,
+                probability=True,
+                class_weight="balanced",
+                random_state=42,
+            )
+            pipe = Pipeline([("scaler", StandardScaler()), ("svm", svc)])
+            pipe.fit(X_train, train_labels)
+
+            scores = pipe.decision_function(X_test)
+            preds = np.where(scores >= 0.0, 1, -1)
+
+            auc_scores.append(float(roc_auc_score(test_labels, scores)))
+            mcc_scores.append(float(matthews_corrcoef(test_labels, preds)))
+            f1_scores.append(float(f1_score(test_labels, preds, pos_label=1, zero_division=0)))
 
         return {
-            "auc_mean": float(auc_scores.mean()),
-            "auc_std": float(auc_scores.std()),
-            "mcc_mean": float(mcc_scores.mean()),
-            "mcc_std": float(mcc_scores.std()),
-            "f1_mean": float(f1_scores.mean()),
-            "f1_std": float(f1_scores.std()),
+            "auc_mean": float(np.mean(auc_scores)),
+            "auc_std": float(np.std(auc_scores)),
+            "mcc_mean": float(np.mean(mcc_scores)),
+            "mcc_std": float(np.std(mcc_scores)),
+            "f1_mean": float(np.mean(f1_scores)),
+            "f1_std": float(np.std(f1_scores)),
         }
 
     def top_features(self, n: int = 15) -> List[Tuple[str, float]]:

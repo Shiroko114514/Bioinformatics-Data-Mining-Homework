@@ -142,6 +142,8 @@ def generate_negative_samples(
 ) -> List[str]:
     if exclude_sites is None:
         exclude_sites = set()
+    if not all_sequences:
+        raise ValueError("Cannot generate negative samples from an empty sequence list.")
     negs = []
     attempts = n_neg * 100
     for _ in range(attempts):
@@ -154,7 +156,9 @@ def generate_negative_samples(
         w = seq[start:start + window]
         if len(w) == window and all(c in BASE_IDX for c in w) and w not in exclude_sites:
             negs.append(w)
-    return negs[:n_neg]
+    if len(negs) < n_neg:
+        raise RuntimeError(f"Could only generate {len(negs)} of {n_neg} requested negative samples.")
+    return negs
 
 
 def load_real_dataset_split(
@@ -208,7 +212,8 @@ def make_donor_positive(n: int = 500) -> List[str]:
 def make_donor_negative(n: int = 500) -> List[str]:
     seqs = []
     while len(seqs) < n:
-        s = list("".join(random.choices(list(BASE_IDX), k=9)))
-        s[3], s[4] = "G", "T"
+        s = random.choices(list(BASE_IDX), k=9)
+        if s[3] == "G" and s[4] == "T":
+            continue
         seqs.append("".join(s))
     return seqs
