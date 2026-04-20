@@ -104,3 +104,42 @@ def make_donor_negative(n=500):
         if s[3:5] == 'GT':
             seqs.append(s)
     return seqs
+
+
+def make_acceptor_positive(n=500):
+    seqs = []
+    for _ in range(n):
+        p0 = _rand_base({"A": 0.35, "G": 0.35, "C": 0.15, "T": 0.15})
+        p1 = _rand_base({"A": 0.45, "G": 0.35, "C": 0.1, "T": 0.1})
+        p2 = _rand_base({"A": 0.7, "G": 0.1, "C": 0.1, "T": 0.1})
+        p3 = _rand_base({"A": 0.1, "G": 0.65, "C": 0.1, "T": 0.15})
+        p4 = _rand_base({"A": 0.7, "G": 0.1, "C": 0.1, "T": 0.1})
+        p5 = _rand_base({"A": 0.65, "G": 0.15, "C": 0.1, "T": 0.1})
+        p6 = _rand_base({"A": 0.1, "G": 0.1, "C": 0.1, "T": 0.7})
+        p7 = _rand_base({"A": 0.1, "G": 0.65, "C": 0.1, "T": 0.15})
+        p8 = _rand_base({"A": 0.1, "G": 0.1, "C": 0.1, "T": 0.7})
+        p9 = _rand_base({"A": 0.1, "G": 0.7, "C": 0.1, "T": 0.1})
+        p10 = _rand_base({"A": 0.35, "G": 0.25, "C": 0.2, "T": 0.2})
+        p11 = _rand_base({"A": 0.25, "G": 0.25, "C": 0.25, "T": 0.25})
+        p12 = _rand_base({"A": 0.25, "G": 0.25, "C": 0.25, "T": 0.25})
+        p13 = _rand_base({"A": 0.2, "G": 0.2, "C": 0.3, "T": 0.3})
+        p14 = _rand_base({"A": 0.2, "G": 0.2, "C": 0.3, "T": 0.3})
+        p15 = _rand_base({"A": 0.2, "G": 0.25, "C": 0.25, "T": 0.3})
+        p16 = _rand_base({"A": 0.15, "G": 0.2, "C": 0.25, "T": 0.4})
+        p17 = _rand_base({"A": 0.2, "G": 0.2, "C": 0.25, "T": 0.35})
+        p18 = _rand_base({"A": 0.2, "G": 0.2, "C": 0.3, "T": 0.3})
+        p19 = _rand_base({"A": 0.25, "G": 0.25, "C": 0.25, "T": 0.25})
+        p20, p21 = "A", "G"
+        p22 = _rand_base({"A": 0.15, "G": 0.4, "C": 0.2, "T": 0.25})
+        seqs.append(''.join([p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21, p22]))
+    return seqs
+
+
+def make_acceptor_negative(n=500):
+    import random
+    seqs = []
+    while len(seqs) < n:
+        s = ''.join(random.choices(list(BASE_IDX), k=23))
+        if s[20:22] == 'AG':
+            seqs.append(s)
+    return seqs

@@ -36,6 +36,62 @@ def _validate_seq(seq: str, length: int) -> Optional[str]:
     return seq
 
 
+def _chi2_matrix(seqs: List[str], window: int) -> List[List[float]]:
+    chi2 = [[0.0 for _ in range(window)] for _ in range(window)]
+    if not seqs:
+        return chi2
+
+    total = float(len(seqs))
+    for i in range(window):
+        for j in range(i + 1, window):
+            table = [[0.0 for _ in BASES] for _ in BASES]
+            for seq in seqs:
+                ai = BASE_IDX.get(seq[i], -1)
+                bj = BASE_IDX.get(seq[j], -1)
+                if ai >= 0 and bj >= 0:
+                    table[ai][bj] += 1.0
+
+            row_sum = [sum(table[r]) for r in range(4)]
+            col_sum = [sum(table[r][c] for r in range(4)) for c in range(4)]
+
+            score = 0.0
+            for r in range(4):
+                for c in range(4):
+                    expected = (row_sum[r] * col_sum[c]) / total
+                    if expected > 1e-12:
+                        diff = table[r][c] - expected
+                        score += (diff * diff) / expected
+            chi2[i][j] = score
+            chi2[j][i] = score
+    return chi2
+
+
+def _select_dependency_pairs(
+    chi2: List[List[float]],
+    threshold: float,
+    max_pairs: int,
+) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int, float]] = []
+    n = len(chi2)
+    for i in range(n):
+        for j in range(i + 1, n):
+            score = chi2[i][j]
+            if score >= threshold:
+                pairs.append((i, j, score))
+
+    if not pairs:
+        for i in range(n):
+            for j in range(i + 1, n):
+                pairs.append((i, j, chi2[i][j]))
+
+    pairs.sort(key=lambda item: item[2], reverse=True)
+    return [(i, j) for i, j, _ in pairs[:max_pairs]]
+
+
+def _pair_index(a: str, b: str) -> int:
+    return BASE_IDX[a] * 4 + BASE_IDX[b]
+
+
 class WMMModel:
     def __init__(self, window: int, site: str = "donor"):
         self.window = window
@@ -194,6 +250,74 @@ class WAMModel:
                 cond_str = f"{best_pair[0]}→{best_pair[1]} ({best_val:.3f})"
             print(f"{i:>4}  {ic_val:>10.4f}  {cond_str}")
         print("=" * 55)
+
+
+class DependencyWAMModel(WAMModel):
+    def __init__(self, window: int, site: str = "donor", dependency_threshold: float = 6.0, max_dependency_pairs: int = 16):
+        super().__init__(window, site)
+        self.dependency_threshold = float(dependency_threshold)
+        self.max_dependency_pairs = max(1, int(max_dependency_pairs))
+        self.dependency_pairs: List[Tuple[int, int]] = []
+        self.pair_log_odds: Optional[List[Dict[int, float]]] = None
+
+    def train(self, pos_seqs: List[str], neg_seqs: List[str]) -> None:
+        super().train(pos_seqs, neg_seqs)
+        valid_pos = [_validate_seq(s, self.window) for s in pos_seqs]
+        valid_pos = [s for s in valid_pos if s]
+        valid_neg = [_validate_seq(s, self.window) for s in neg_seqs]
+        valid_neg = [s for s in valid_neg if s]
+
+        chi2 = _chi2_matrix(valid_pos, self.window)
+        self.dependency_pairs = _select_dependency_pairs(chi2, self.dependency_threshold, self.max_dependency_pairs)
+
+        bg_seqs = valid_neg if valid_neg else valid_pos
+        if not bg_seqs:
+            self.pair_log_odds = []
+            return
+
+        self.pair_log_odds = []
+        for i, j in self.dependency_pairs:
+            fg_counts = {code: PSEUDOCOUNT for code in range(16)}
+            bg_counts = {code: PSEUDOCOUNT for code in range(16)}
+            for seq in valid_pos:
+                fg_counts[_pair_index(seq[i], seq[j])] += 1.0
+            for seq in bg_seqs:
+                bg_counts[_pair_index(seq[i], seq[j])] += 1.0
+
+            fg_total = sum(fg_counts.values())
+            bg_total = sum(bg_counts.values())
+            odds = {}
+            for code in range(16):
+                fg = fg_counts.get(code, PSEUDOCOUNT) / fg_total
+                bg = bg_counts.get(code, PSEUDOCOUNT) / bg_total
+                odds[code] = math.log(max(fg, 1e-10) / max(bg, 1e-10))
+            self.pair_log_odds.append(odds)
+
+    def score(self, seq: str) -> float:
+        base_score = super().score(seq)
+        if self.pair_log_odds is None:
+            raise RuntimeError("Model not trained. Call train() first.")
+        seq = seq.upper()
+        if len(seq) != self.window:
+            raise ValueError(f"Expected length {self.window}, got {len(seq)}")
+
+        dep_score = 0.0
+        for (i, j), odds in zip(self.dependency_pairs, self.pair_log_odds):
+            a = seq[i]
+            b = seq[j]
+            if a not in BASE_IDX or b not in BASE_IDX:
+                continue
+            dep_score += odds.get(_pair_index(a, b), 0.0)
+        return base_score + dep_score
+
+    def print_summary(self) -> None:
+        super().print_summary()
+        if not self.dependency_pairs:
+            print("No dependency pairs selected.")
+            return
+        print("Dependency pairs (chi2-selected):")
+        for i, j in self.dependency_pairs[:12]:
+            print(f"  ({i:>2}, {j:>2})")
 
 
 def evaluate(y_true: List[int], y_pred: List[int]) -> Dict[str, float]:

@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 
 import numpy as np
 
@@ -27,7 +28,13 @@ def demo() -> None:
 
     ablation_study(train_pos, train_neg, test_pos, test_neg)
     kernel_comparison(train_pos, train_neg, test_pos, test_neg)
-    four_way_comparison(train_pos, train_neg, test_pos, test_neg)
+    four_way_comparison(
+        train_pos,
+        train_neg,
+        test_pos,
+        test_neg,
+        plot_output=Path(__file__).with_name("roc_curves.svg"),
+    )
 
     print("\n-- Linear SVM - top 12 discriminative features ------------")
     lin = SVMSpliceSite(window=DONOR_WINDOW, kernel="linear", C=1.0, feature_set=list(FeatureExtractor.ALL_FEATURES))

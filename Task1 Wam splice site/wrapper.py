@@ -3,7 +3,7 @@
 This file now delegates execution to main.py.
 """
 
-from main import demo
+from main import main
 
 if __name__ == "__main__":
-    demo()
+    main()

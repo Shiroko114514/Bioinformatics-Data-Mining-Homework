@@ -310,7 +310,7 @@ class _WMMModel:
         self.log_odds = None
 
     def train(self, pos_seqs, neg_seqs):
-        from .splice_utils import empirical_bg, BASES, PSEUDOCOUNT
+        from splice_utils import empirical_bg, BASES, PSEUDOCOUNT
         pos = validate_seqs(pos_seqs, self.window)
         n = self.window
         bg = empirical_bg(neg_seqs) if neg_seqs else {b: 0.25 for b in BASES}

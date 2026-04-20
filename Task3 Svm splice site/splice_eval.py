@@ -11,6 +11,7 @@ from sklearn.metrics import confusion_matrix, f1_score, matthews_corrcoef, preci
 from splice_features import FeatureExtractor
 from splice_model import SVMSpliceSite
 from splice_utils import BASE_IDX, BASES, DONOR_WINDOW, PSEUDOCOUNT, validate_seqs
+from roc_plot import plot_roc_curves
 
 
 def evaluate_full(
@@ -202,18 +203,36 @@ def _build_probabilistic_models(train_pos, train_neg, window):
 def _load_task2_bn_model_class() -> Optional[type]:
     task2_dir = Path(__file__).resolve().parent.parent / "Task2 Bayesian network splice"
     model_path = task2_dir / "splice_model.py"
+    utils_path = task2_dir / "splice_utils.py"
     if not model_path.exists():
         return None
-
-    if str(task2_dir) not in sys.path:
-        sys.path.insert(0, str(task2_dir))
+    if not utils_path.exists():
+        return None
 
     spec = importlib.util.spec_from_file_location("task2_splice_model", str(model_path))
     if spec is None or spec.loader is None:
         return None
 
+    utils_spec = importlib.util.spec_from_file_location("splice_utils", str(utils_path))
+    if utils_spec is None or utils_spec.loader is None:
+        return None
+
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    utils_mod = importlib.util.module_from_spec(utils_spec)
+    original_sys_path = list(sys.path)
+    original_splice_utils = sys.modules.get("splice_utils")
+    task3_dir = str(Path(__file__).resolve().parent)
+    try:
+        sys.path = [str(task2_dir)] + [p for p in sys.path if p != task3_dir]
+        sys.modules["splice_utils"] = utils_mod
+        utils_spec.loader.exec_module(utils_mod)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path = original_sys_path
+        if original_splice_utils is not None:
+            sys.modules["splice_utils"] = original_splice_utils
+        else:
+            sys.modules.pop("splice_utils", None)
     return getattr(mod, "BayesianNetworkModel", None)
 
 
@@ -223,6 +242,7 @@ def four_way_comparison(
     test_pos: List[str],
     test_neg: List[str],
     window: int = DONOR_WINDOW,
+    plot_output: Optional[str | Path] = None,
 ) -> None:
     test_seqs = test_pos + test_neg
     test_labels_pm1 = [1] * len(test_pos) + [-1] * len(test_neg)
@@ -274,9 +294,28 @@ def four_way_comparison(
     ]
 
     all_mets = []
+    roc_data = []
     for _, sc, lbl in models:
         preds = [1 if s >= 0.0 else -1 for s in sc]
-        all_mets.append(evaluate_full(lbl, preds, sc))
+        met = evaluate_full(lbl, preds, sc)
+        all_mets.append(met)
+        fpr = []
+        tpr = []
+        thresholds = sorted(set(sc), reverse=True)
+        if thresholds:
+            step = max(1, len(thresholds) // 200)
+            thresholds = thresholds[::step]
+        fpr.append(0.0)
+        tpr.append(0.0)
+        for thr in thresholds:
+            pred = [1 if s >= thr else -1 for s in sc]
+            m = evaluate_full(lbl, pred, sc)
+            fpr.append(1.0 - m["specificity"])
+            tpr.append(m["sensitivity"])
+        fpr.append(1.0)
+        tpr.append(1.0)
+        auc = roc_auc_score(lbl, sc)
+        roc_data.append((models[len(roc_data)][0], fpr, tpr, float(auc)))
 
     for label, key in rows:
         vals = [m[key] for m in all_mets]
@@ -290,3 +329,7 @@ def four_way_comparison(
     print("  " + "-" * 64)
     print("  < = best in row")
     print("=" * 68)
+
+    if plot_output is not None:
+        saved = plot_roc_curves(roc_data, plot_output)
+        print(f"\n  ROC figure saved to: {saved}")

@@ -94,7 +94,9 @@ def main():
         test_neg = generate_negative_samples(test_seqs, len(test_pos), window=(args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW)), exclude_sites=set(test_pos))
 
         compare_models(train_pos, train_neg, test_pos, test_neg,
-                       window=args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW), threshold=args.threshold)
+                       window=args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW),
+                       threshold=args.threshold,
+                       plot_output=Path(__file__).with_name('roc_curves.svg'))
 
 
 if __name__ == '__main__':
