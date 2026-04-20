@@ -10,7 +10,9 @@ from splice_utils import DONOR_WINDOW, ACCEPTOR_WINDOW
 def train_model_for_prediction(use_real_data: bool = True,
                                site_type: str = 'donor',
                                window: int = None,
-                               structure: str = 'chow-liu') -> BayesianNetworkModel:
+                               structure: str = 'chow-liu',
+                               max_parents: int = 2,
+                               dependency_threshold: float = 6.0) -> BayesianNetworkModel:
     if window is None:
         window = DONOR_WINDOW if site_type == 'donor' else ACCEPTOR_WINDOW
 
@@ -23,7 +25,13 @@ def train_model_for_prediction(use_real_data: bool = True,
     else:
         raise NotImplementedError('Synthetic training not implemented in main module')
 
-    model = BayesianNetworkModel(window=window, site=site_type, structure=structure)
+    model = BayesianNetworkModel(
+        window=window,
+        site=site_type,
+        structure=structure,
+        max_parents=max_parents,
+        dependency_threshold=dependency_threshold,
+    )
     model.train(train_pos, train_neg)
     return model
 
@@ -47,6 +55,9 @@ def main():
     parser.add_argument('--site', choices=['donor', 'acceptor'], default='donor')
     parser.add_argument('--threshold', type=float, default=0.0)
     parser.add_argument('--window', type=int, choices=[9, 23], default=None)
+    parser.add_argument('--structure', choices=['chain', 'chow-liu', 'ebn'], default='chow-liu')
+    parser.add_argument('--max-parents', type=int, default=2)
+    parser.add_argument('--chi2-threshold', type=float, default=6.0)
     parser.add_argument('--no-real-data', action='store_true')
     parser.add_argument('--demo', action='store_true')
 
@@ -55,7 +66,10 @@ def main():
     if args.predict:
         model = train_model_for_prediction(use_real_data=not args.no_real_data,
                                            site_type=args.site,
-                                           window=args.window)
+                                           window=args.window,
+                                           structure=args.structure,
+                                           max_parents=args.max_parents,
+                                           dependency_threshold=args.chi2_threshold)
         results = predict_splice_sites_in_genome(args.predict.upper(), model, threshold=args.threshold)
         if not results:
             print('No sites above threshold.')

@@ -18,6 +18,9 @@ class SVMSpliceSite:
         site: str = "donor",
         kernel: Literal["linear", "rbf", "poly", "sigmoid", "precomputed"] = "rbf",
         feature_set: Union[str, List[str]] = "combined",
+        dependency_threshold: float = 6.0,
+        max_dependency_pairs: int = 16,
+        ebn_max_parents: int = 2,
         C: float = 1.0,
         gamma: Union[float, Literal["scale", "auto"]] = "scale",
         degree: int = 3,
@@ -27,6 +30,9 @@ class SVMSpliceSite:
         self.site = site
         self.kernel = kernel
         self.feature_set = feature_set
+        self.dependency_threshold = dependency_threshold
+        self.max_dependency_pairs = max_dependency_pairs
+        self.ebn_max_parents = ebn_max_parents
         self.C = C
         self.gamma = gamma
         self.degree = degree
@@ -45,8 +51,14 @@ class SVMSpliceSite:
         self._train_pos = pos
         self._train_neg = neg
 
-        self.extractor = FeatureExtractor(self.window, self.feature_set)
-        self.extractor.fit(pos)
+        self.extractor = FeatureExtractor(
+            self.window,
+            self.feature_set,
+            dependency_threshold=self.dependency_threshold,
+            max_dependency_pairs=self.max_dependency_pairs,
+            ebn_max_parents=self.ebn_max_parents,
+        )
+        self.extractor.fit(pos, neg)
 
         X_pos = self.extractor.transform(pos)
         X_neg = self.extractor.transform(neg)
@@ -127,7 +139,14 @@ class SVMSpliceSite:
             test_labels = y[test_idx]
 
             train_pos_fold = [seq for seq, label in zip(train_seqs, train_labels) if label == 1]
-            extractor = FeatureExtractor(self.window, self.feature_set).fit(train_pos_fold)
+            train_neg_fold = [seq for seq, label in zip(train_seqs, train_labels) if label == -1]
+            extractor = FeatureExtractor(
+                self.window,
+                self.feature_set,
+                dependency_threshold=self.dependency_threshold,
+                max_dependency_pairs=self.max_dependency_pairs,
+                ebn_max_parents=self.ebn_max_parents,
+            ).fit(train_pos_fold, train_neg_fold)
 
             X_train = extractor.transform(train_seqs)
             X_test = extractor.transform(test_seqs)

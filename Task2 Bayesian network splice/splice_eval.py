@@ -41,7 +41,7 @@ def compare_models(train_pos: List[str], train_neg: List[str], test_pos: List[st
         ("WMM", _WMMModel(window)),
         ("WAM", _WAMModel(window)),
         ("BN Chow-Liu", BayesianNetworkModel(window, site='donor', structure='chow-liu')),
-        ("BN greedy-BIC", BayesianNetworkModel(window, site='donor', structure='greedy-bic')),
+        ("BN EBN(p=2)", BayesianNetworkModel(window, site='donor', structure='ebn', max_parents=2)),
     ]
     print("\nTraining models …")
     for name, m in models:
@@ -51,7 +51,7 @@ def compare_models(train_pos: List[str], train_neg: List[str], test_pos: List[st
     test_seqs = test_pos + test_neg
     test_labels = [1]*len(test_pos) + [0]*len(test_neg)
     print("\n" + "="*70)
-    print("  WMM / WAM / BN Chow-Liu / BN greedy-BIC  — Donor Site Prediction")
+    print("  WMM / WAM / BN Chow-Liu / BN EBN(p=2)  — Donor Site Prediction")
     print("="*70)
     hdr = f"{'Metric':<20}" + ''.join(f"{n:>15}" for n, _ in models)
     print(hdr)
@@ -92,3 +92,11 @@ def compare_models(train_pos: List[str], train_neg: List[str], test_pos: List[st
         for child, parent in non_adj:
             mi_val = bn_cl.mi_matrix[child][parent] if bn_cl.mi_matrix else float('nan')
             print(f"    pos {parent} → pos {child}  gap={abs(child-parent)}  MI={mi_val:.4f} nats")
+
+    bn_ebn = models[3][1]
+    bn_ebn.print_summary()
+    non_adj_ebn = bn_ebn.non_adjacent_edges()
+    if non_adj_ebn:
+        print("\n  Long-range edges discovered by EBN dependency expansion:")
+        for child, parent in non_adj_ebn[:20]:
+            print(f"    pos {parent} → pos {child}  gap={abs(child-parent)}")

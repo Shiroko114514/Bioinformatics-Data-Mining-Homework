@@ -53,8 +53,11 @@ def ablation_study(
         ("k-mer (2+3)", ["kmer2", "kmer3"]),
         ("Dinuc positional", ["dinuc_pos"]),
         ("PWM log-odds", ["pwm"]),
+        ("Chi2 dependency pairs", ["chi2_pairs"]),
+        ("EBN LLR only", ["ebn_llr"]),
         ("One-hot + k-mer", ["one_hot", "kmer2", "kmer3"]),
         ("One-hot + dinuc + PWM", ["one_hot", "dinuc_pos", "pwm"]),
+        ("Dependency-aware set", ["one_hot", "dinuc_pos", "chi2_pairs", "ebn_llr"]),
         ("Combined (all)", list(FeatureExtractor.ALL_FEATURES)),
     ]
 
