@@ -1,8 +1,53 @@
 import re
 import random
 from pathlib import Path
-from typing import List, Tuple, Set
-from splice_utils import BASES
+from typing import List, Optional, Set, Tuple, Union
+from splice_utils import ACCEPTOR_WINDOW, DONOR_WINDOW, BASES
+
+
+def _iter_txt_files(dir_path: str) -> List[Path]:
+    p = Path(dir_path)
+    files = sorted(p.glob('*.TXT')) + sorted(p.glob('*.txt'))
+    unique_files: List[Path] = []
+    seen_names = set()
+    for txt_file in files:
+        key = txt_file.name.upper()
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        unique_files.append(txt_file)
+    return unique_files
+
+
+def _canonical_signature(site_type: str) -> Tuple[str, int]:
+    if site_type == 'donor':
+        return 'GT', 3
+    if site_type == 'acceptor':
+        return 'AG', 20
+    raise ValueError(f'Unknown site type: {site_type}')
+
+
+def _unique_keep_order(seqs: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for s in seqs:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _collect_canonical_windows(seq: str, window: int, site_type: str) -> List[str]:
+    dinuc, dinuc_offset = _canonical_signature(site_type)
+    out: List[str] = []
+    if len(seq) < window:
+        return out
+    for i in range(0, len(seq) - window + 1):
+        win = seq[i:i + window]
+        if win[dinuc_offset:dinuc_offset + 2] == dinuc:
+            out.append(win)
+    return out
 
 
 def parse_genbank_file(filepath: str) -> Tuple[str, List[Tuple[int, int]]]:
@@ -95,31 +140,98 @@ def extract_splice_sites_from_ranges(seq: str, ranges: List[Tuple[int, int]],
 
 def load_positive_sites_from_dir(dir_path: str, site_type: str = 'donor', window: int = 9) -> List[str]:
     all_sites = []
-    p = Path(dir_path)
-    for txt_file in sorted(p.glob('*.TXT')) + sorted(p.glob('*.txt')):
-        if txt_file.name.endswith('.txt') and Path(str(txt_file).replace('.txt', '.TXT')).exists():
-            continue
+    for txt_file in _iter_txt_files(dir_path):
         seq, ranges = parse_genbank_file(str(txt_file))
         if seq and ranges:
             all_sites.extend(extract_splice_sites_from_ranges(seq, ranges,
                                                             site_type=site_type,
                                                             window=window))
-    return all_sites
+    return _unique_keep_order(all_sites)
 
 
 def load_sequences_from_dir(dir_path: str) -> List[str]:
     result = []
-    p = Path(dir_path)
-    for txt_file in sorted(p.glob('*.TXT')) + sorted(p.glob('*.txt')):
-        if txt_file.name.endswith('.txt') and Path(str(txt_file).replace('.txt', '.TXT')).exists():
-            continue
+    for txt_file in _iter_txt_files(dir_path):
         seq, _ = parse_genbank_file(str(txt_file))
         if seq:
             result.append(seq)
     return result
 
 
-from typing import Optional
+def load_hard_negative_sites_from_dir(
+    dir_path: str,
+    site_type: str = 'donor',
+    window: int = DONOR_WINDOW,
+    exclude_sites: Optional[Set[str]] = None,
+) -> List[str]:
+    exclude = exclude_sites if exclude_sites is not None else set()
+    all_sites: List[str] = []
+    for txt_file in _iter_txt_files(dir_path):
+        seq, _ = parse_genbank_file(str(txt_file))
+        if not seq:
+            continue
+        for win in _collect_canonical_windows(seq, window=window, site_type=site_type):
+            if win not in exclude:
+                all_sites.append(win)
+    return _unique_keep_order(all_sites)
+
+
+def load_strict_dataset_split(
+    base_path: Optional[Union[str, Path]] = None,
+    site: str = 'donor',
+    window: Optional[int] = None,
+    seed: int = 42,
+) -> Tuple[List[str], List[str], List[str], List[str]]:
+    if window is None:
+        window = DONOR_WINDOW if site == 'donor' else ACCEPTOR_WINDOW
+
+    base = (
+        Path(base_path)
+        if base_path is not None
+        else Path(__file__).resolve().parent.parent / 'Training and testing datasets'
+    )
+    train_dir = base / 'Training Set'
+    test_dir = base / 'Testing Set'
+    if train_dir.resolve() == test_dir.resolve():
+        raise RuntimeError('Training Set and Testing Set must be different directories.')
+
+    train_pos = load_positive_sites_from_dir(str(train_dir), site_type=site, window=window)
+    test_pos_all = load_positive_sites_from_dir(str(test_dir), site_type=site, window=window)
+
+    train_pos_set = set(train_pos)
+    test_pos = [w for w in test_pos_all if w not in train_pos_set]
+
+    train_neg_pool = load_hard_negative_sites_from_dir(
+        str(train_dir),
+        site_type=site,
+        window=window,
+        exclude_sites=train_pos_set,
+    )
+    train_neg_set = set(train_neg_pool)
+    test_neg_pool = load_hard_negative_sites_from_dir(
+        str(test_dir),
+        site_type=site,
+        window=window,
+        exclude_sites=set(test_pos) | train_pos_set | train_neg_set,
+    )
+
+    rng = random.Random(seed)
+    rng.shuffle(train_pos)
+    rng.shuffle(test_pos)
+    rng.shuffle(train_neg_pool)
+    rng.shuffle(test_neg_pool)
+
+    n_train = min(len(train_pos), len(train_neg_pool))
+    n_test = min(len(test_pos), len(test_neg_pool))
+    if n_train == 0 or n_test == 0:
+        raise RuntimeError('Strict split produced an empty train/test set. Check data parsing and constraints.')
+
+    return (
+        train_pos[:n_train],
+        train_neg_pool[:n_train],
+        test_pos[:n_test],
+        test_neg_pool[:n_test],
+    )
 
 
 def generate_negative_samples(all_sequences: List[str], n_neg: int, window: int = 9,

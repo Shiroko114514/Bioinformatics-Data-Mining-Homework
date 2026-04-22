@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from splice_data import load_positive_sites_from_dir, load_sequences_from_dir, generate_negative_samples
+from splice_data import load_strict_dataset_split
 from splice_model import BayesianNetworkModel, BNScanner
 from splice_eval import compare_models
 from splice_utils import DONOR_WINDOW, ACCEPTOR_WINDOW
@@ -17,11 +17,7 @@ def train_model_for_prediction(use_real_data: bool = True,
         window = DONOR_WINDOW if site_type == 'donor' else ACCEPTOR_WINDOW
 
     if use_real_data:
-        base_path = Path(__file__).parent.parent / 'Training and testing datasets'
-        train_dir = base_path / 'Training Set'
-        train_pos = load_positive_sites_from_dir(str(train_dir), site_type=site_type, window=window)
-        train_seqs = load_sequences_from_dir(str(train_dir))
-        train_neg = generate_negative_samples(train_seqs, len(train_pos), window=window, exclude_sites=set(train_pos))
+        train_pos, train_neg, _, _ = load_strict_dataset_split(site=site_type, window=window)
     else:
         raise NotImplementedError('Synthetic training not implemented in main module')
 
@@ -81,20 +77,11 @@ def main():
 
     if args.demo or not args.predict:
         print('Running benchmark demo with training/testing data output...')
-        base_path = Path(__file__).parent.parent / 'Training and testing datasets'
-        train_dir = str(base_path / 'Training Set')
-        test_dir = str(base_path / 'Testing Set')
-
-        train_pos = load_positive_sites_from_dir(train_dir, site_type=args.site, window=(args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW)))
-        test_pos = load_positive_sites_from_dir(test_dir, site_type=args.site, window=(args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW)))
-        train_seqs = load_sequences_from_dir(train_dir)
-        test_seqs = load_sequences_from_dir(test_dir)
-
-        train_neg = generate_negative_samples(train_seqs, len(train_pos), window=(args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW)), exclude_sites=set(train_pos))
-        test_neg = generate_negative_samples(test_seqs, len(test_pos), window=(args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW)), exclude_sites=set(test_pos))
+        use_window = args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW)
+        train_pos, train_neg, test_pos, test_neg = load_strict_dataset_split(site=args.site, window=use_window)
 
         compare_models(train_pos, train_neg, test_pos, test_neg,
-                       window=args.window or (DONOR_WINDOW if args.site == 'donor' else ACCEPTOR_WINDOW),
+                       window=use_window,
                        threshold=args.threshold,
                        plot_output=Path(__file__).with_name('roc_curves.svg'))
 

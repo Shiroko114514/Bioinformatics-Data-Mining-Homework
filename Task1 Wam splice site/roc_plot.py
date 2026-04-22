@@ -3,6 +3,28 @@ from pathlib import Path
 from typing import List, Tuple, Union
 
 
+def _smooth_svg_path(points: List[Tuple[float, float]]) -> str:
+    if not points:
+        return ""
+    if len(points) < 3:
+        return "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+
+    path = [f"M {points[0][0]:.1f},{points[0][1]:.1f}"]
+    for i in range(1, len(points) - 2):
+        cx = points[i][0]
+        cy = points[i][1]
+        mx = (points[i][0] + points[i + 1][0]) / 2.0
+        my = (points[i][1] + points[i + 1][1]) / 2.0
+        path.append(f"Q {cx:.1f},{cy:.1f} {mx:.1f},{my:.1f}")
+
+    cx = points[-2][0]
+    cy = points[-2][1]
+    ex = points[-1][0]
+    ey = points[-1][1]
+    path.append(f"Q {cx:.1f},{cy:.1f} {ex:.1f},{ey:.1f}")
+    return " ".join(path)
+
+
 def plot_roc_curves(
     roc_data: List[Tuple[str, List[float], List[float], float]],
     output_path: Union[str, Path],
@@ -66,9 +88,10 @@ def plot_roc_curves(
 
     for idx, (name, fpr, tpr, auc) in enumerate(roc_data):
         color = palette[idx % len(palette)]
-        points = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(fpr, tpr))
+        curve_points = [(sx(x), sy(y)) for x, y in zip(fpr, tpr)]
+        curve_path = _smooth_svg_path(curve_points)
         elements.append(
-            f'<polyline fill="none" stroke="{color}" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round" points="{points}"/>'
+            f'<path d="{curve_path}" fill="none" stroke="{color}" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round"/>'
         )
         elements.append(f'<circle cx="{sx(fpr[-1]):.1f}" cy="{sy(tpr[-1]):.1f}" r="3.5" fill="{color}"/>')
         elements.append(

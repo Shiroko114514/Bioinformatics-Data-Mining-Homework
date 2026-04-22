@@ -247,36 +247,17 @@ def four_way_comparison(
     test_seqs = test_pos + test_neg
     test_labels_pm1 = [1] * len(test_pos) + [-1] * len(test_neg)
 
-    wmm, wam = _build_probabilistic_models(train_pos, train_neg, window)
-
-    bn_scores = None
-    BayesianNetworkModel = _load_task2_bn_model_class()
-    if BayesianNetworkModel is not None:
-        try:
-            bn = BayesianNetworkModel(window=window, site="donor", structure="chow-liu")
-            bn.train(train_pos, train_neg)
-            bn_raw = bn.score_batch(test_seqs)
-            bn_scores = [float(s) for s in bn_raw]
-        except Exception:
-            bn_scores = None
-
     svm = SVMSpliceSite(window=window, kernel="rbf", C=1.0, feature_set=list(FeatureExtractor.ALL_FEATURES))
     svm.train(train_pos, train_neg)
 
-    wmm_sc = wmm.score_batch(test_seqs)
-    wam_sc = wam.score_batch(test_seqs)
     svm_sc = svm.decision_score_batch(test_seqs)
 
     models = [
-        ("WMM", wmm_sc, test_labels_pm1),
-        ("WAM", wam_sc, test_labels_pm1),
+        ("SVM (RBF)", svm_sc, test_labels_pm1),
     ]
-    if bn_scores is not None:
-        models.append(("BN Chow-Liu", bn_scores, test_labels_pm1))
-    models.append(("SVM (RBF)", svm_sc, test_labels_pm1))
 
     print("\n" + "=" * 68)
-    print("  Four-way comparison - Donor Site Prediction")
+    print("  Support Vector Machine - Donor Site Prediction")
     print("=" * 68)
     print(f"  {'Metric':<16}", end="")
     for name, _, _ in models:
@@ -295,7 +276,7 @@ def four_way_comparison(
 
     all_mets = []
     roc_data = []
-    for _, sc, lbl in models:
+    for name, sc, lbl in models:
         preds = [1 if s >= 0.0 else -1 for s in sc]
         met = evaluate_full(lbl, preds, sc)
         all_mets.append(met)
@@ -315,7 +296,7 @@ def four_way_comparison(
         fpr.append(1.0)
         tpr.append(1.0)
         auc = roc_auc_score(lbl, sc)
-        roc_data.append((models[len(roc_data)][0], fpr, tpr, float(auc)))
+        roc_data.append((name, fpr, tpr, float(auc)))
 
     for label, key in rows:
         vals = [m[key] for m in all_mets]

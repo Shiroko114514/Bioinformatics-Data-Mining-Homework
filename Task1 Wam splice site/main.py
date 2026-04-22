@@ -3,7 +3,7 @@ import pickle
 from pathlib import Path
 
 from data_io import (
-    load_txt_sequences_from_dir,
+    load_strict_dataset_split,
     make_acceptor_negative,
     make_acceptor_positive,
     make_donor_negative,
@@ -132,12 +132,7 @@ def predict_on_sequence(sequence, model_path="wam_model.pkl", threshold=1.0):
 
 
 def _load_dataset(site: str, window: int):
-    base_path = Path(__file__).resolve().parent.parent / "Training and testing datasets"
-    training_dir = str(base_path / "Training Set")
-    testing_dir = str(base_path / "Testing Set")
-
-    train_pos, train_neg = load_txt_sequences_from_dir(training_dir, window=window, site=site)
-    test_pos, test_neg = load_txt_sequences_from_dir(testing_dir, window=window, site=site)
+    train_pos, train_neg, test_pos, test_neg = load_strict_dataset_split(site=site, window=window)
 
     if not train_pos or not test_pos:
         print("Training/testing directories not found or empty; generating synthetic dataset …")
