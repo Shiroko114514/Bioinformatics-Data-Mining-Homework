@@ -33,12 +33,13 @@
 ### 4. 编程实现
 
 1. 代码拆分为数据读写、模型、扫描、预测与主程序等模块。
-2. 支持 `--site donor` 和 `--site acceptor`，默认为 donor。
-3. 训练和测试数据路径基于仓库位置自动解析，不依赖硬编码绝对路径。
-4. 当真实数据不可用时，自动生成合成数据作为回退。
-5. `main.py` demo 会自动生成 ROC 曲线图 `roc_curves.svg`。
-6. ROC 绘图逻辑单独拆分到 `roc_plot.py`，支持复用。
-7. 支持模型训练后的保存与复用，并支持基因组序列滑窗扫描。
+2. 提供训练与预测的独立入口：`wrapper.py`（训练并保存模型）和 `predict.py`（加载模型进行序列预测）。
+3. `main.py` 提供 demo 比较与可视化入口：运行 `python main.py --demo` 会生成包含 `WMM`、`WAM` 与 `Dependency-WAM` 的 `roc_curves.svg`。
+4. 支持 `--site donor` 和 `--site acceptor`，默认为 `donor`。
+5. 训练和测试数据路径基于仓库位置自动解析，不依赖硬编码绝对路径。
+6. 当真实数据不可用时，会自动生成合成数据作为回退（训练脚本在缺数据时会尝试合成样本以保证流程可运行）。
+7. ROC 绘图逻辑单独拆分到 `roc_plot.py`，支持复用。
+8. 支持模型训练后的保存与复用，并支持基因组序列滑窗扫描。
 
 ### 5. 测试
 
@@ -80,7 +81,8 @@
 ### 4. 编程实现
 
 1. 代码按 data/model/eval/main 分层组织，模块边界清晰。
-2. 支持命令行参数：
+2. 基本依赖：Python 3.8+，仅使用标准库（无外部依赖）。
+3. 支持命令行参数：
    - `--site`：donor 或 acceptor（默认 donor）
    - `--threshold`：分数阈值（默认 0.0）
    - `--window`：窗口大小（9 或 23，自动选择）
@@ -129,15 +131,16 @@
 
 ### 4. 编程实现
 
-1. 环境依赖：Python 3.13+、numpy、scikit-learn。
-2. 代码已模块化拆分为 utils、data、features、model、eval、main。
+1. 环境依赖：Python 3.13+、`numpy`、`scikit-learn`。
+2. 代码已模块化拆分为 `utils`、`data`、`features`、`model`、`eval`、`main`。
 3. 提供多套脚本与入口：
-   - `wrapper.py`：训练模型并保存到 `svm_splice_site.pkl`
-   - `predict.py`：加载模型并对输入 DNA 序列进行扫描预测
-   - `splice_main.py`：完整 demo 包括特征消融、核函数比较、四方模型对比、线性 SVM 重要特征分析、5折交叉验证、genome scan
-4. ROC 绘图逻辑单独拆分到 `roc_plot.py`，输出 SVG 格式图文件。
-5. Demo 运行时会自动生成 `roc_curves.svg`，包含多模型 ROC 曲线对比。
-6. 通过统一接口保证训练与预测链路可维护、可复现。
+   - `wrapper.py`：训练模型并保存到 `svm_splice_site.pkl`（训练入口）。
+   - `predict.py`：加载模型并对输入 DNA 序列进行扫描预测（若模型文件缺失，会提示先运行 `wrapper.py`）。
+   - `splice_main.py`：完整 demo，包括特征消融、核函数比较、四方模型对比、线性 SVM 重要特征分析、5 折交叉验证、genome scan。
+4. 如果训练数据不足，`wrapper.py` 在本项目中会报错以避免静默生成不完整结果（Task3 不使用自动合成作为隐式回退）。
+5. ROC 绘图逻辑单独拆分到 `roc_plot.py`，输出 SVG 格式图文件。
+6. Demo 运行时会自动生成 `roc_curves.svg`，包含多模型 ROC 曲线对比。
+7. 通过统一接口保证训练与预测链路可维护、可复现。
 
 ### 5. 测试与评估
 
